@@ -17,6 +17,11 @@ use tokio::{
 use crate::config::configuration::PluginSpec;
 use protocol::{Request, Response, PROTOCOL_VERSION};
 
+// Integration tests include this module without the CLI dispatcher, so its
+// public entry points otherwise appear unused in that separate test crate.
+#[allow(dead_code)]
+pub mod installer;
+
 const SIDECAR_SOURCE: &str = include_str!("sidecar.mjs");
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
