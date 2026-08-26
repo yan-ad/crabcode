@@ -11,6 +11,91 @@ use std::path::{Path, PathBuf};
 // Re-export json5 for use in load_config_value
 use json5;
 
+/// Cheap theme resolve for first paint: peek config `theme` + prefs, then discover.
+/// Skips full ConfigLoader / skills / agents.
+pub fn resolve_startup_theme(
+    cwd: &Path,
+    prefs_theme_id: Option<&str>,
+    theme_transparent: bool,
+) -> (Vec<crate::theme::Theme>, usize, bool, bool) {
+    let xdg_config_home = xdg_config_home();
+    let project_root = discover_project_root(cwd);
+    let config_theme_id = peek_config_theme_id(&xdg_config_home, &project_root);
+    let selected = config_theme_id
+        .as_deref()
+        .or(prefs_theme_id)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let (themes, idx) = discover_themes(&xdg_config_home, &project_root, cwd, selected);
+    let theme = themes
+        .get(idx)
+        .or_else(|| themes.first())
+        .cloned()
+        .unwrap_or_else(crate::theme::Theme::load_builtin_default);
+    let dark_mode = matches!(theme.appearance, crate::theme::ThemeAppearance::Dark);
+    (themes, idx, dark_mode, theme_transparent)
+}
+
+fn plugin_command_directories(plugins: &[PluginSpec], project_root: &Path) -> Vec<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache"));
+    let mut directories = Vec::new();
+
+    for plugin in plugins {
+        let source = plugin.source.trim();
+        if source.is_empty() {
+            continue;
+        }
+
+        let package_dir = if source.starts_with('.') || Path::new(source).is_absolute() {
+            let path = PathBuf::from(source);
+            Some(if path.is_absolute() {
+                path
+            } else {
+                project_root.join(path)
+            })
+        } else {
+            let candidates = [
+                project_root.join("node_modules").join(source),
+                cache_home
+                    .join("opencode/packages")
+                    .join(source)
+                    .join("node_modules")
+                    .join(source),
+            ];
+            candidates.into_iter().find(|path| path.is_dir())
+        };
+
+        if let Some(package_dir) = package_dir.filter(|path| path.is_dir()) {
+            directories.push(package_dir.join(".opencode"));
+        }
+    }
+
+    directories.sort();
+    directories.dedup();
+    directories
+}
+
+fn peek_config_theme_id(xdg_config_home: &Path, project_root: &Path) -> Option<String> {
+    let sources = resolve_sources(xdg_config_home, project_root).ok()?;
+    let mut theme_id = None;
+    for source in sources {
+        let Ok(value) = load_config_value(&source.path) else {
+            continue;
+        };
+        let filtered = filter_top_level(value, source.kind);
+        if let Some(id) = filtered.get("theme").and_then(|v| v.as_str()) {
+            let id = id.trim();
+            if !id.is_empty() {
+                theme_id = Some(id.to_string());
+            }
+        }
+    }
+    theme_id
+}
+
 pub fn discover_themes(
     xdg_config_home: &Path,
     project_root: &Path,
@@ -325,6 +410,7 @@ impl Default for ImagesConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebsearchProvider {
     ExaHostedMcp,
+    FirecrawlHostedMcp,
     Exa,
     Tavily,
     Perplexity,
@@ -338,6 +424,7 @@ impl WebsearchProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExaHostedMcp => "exa-hosted-mcp",
+            Self::FirecrawlHostedMcp => "firecrawl-hosted-mcp",
             Self::Exa => "exa",
             Self::Tavily => "tavily",
             Self::Perplexity => "perplexity",
@@ -476,6 +563,7 @@ pub enum ProviderTimeout {
 #[derive(Debug, Clone, Default)]
 pub struct MergedConfig {
     pub theme: Option<String>,
+    pub tui_compact_mode: Option<bool>,
     pub model: Option<String>,
     pub small_model: Option<String>,
     pub default_agent: Option<String>,
@@ -639,14 +727,15 @@ impl ConfigLoader {
 
         substitute_placeholders(&mut merged, &provenance, &mut diagnostics);
 
+        let mut merged_config = parse_merged_config(&merged, &mut diagnostics);
         let commands = load_custom_commands(
             &sources,
             &xdg_config_home,
             &project_root,
+            &merged_config.plugins,
             &mut inventory,
             &mut diagnostics,
         );
-        let mut merged_config = parse_merged_config(&merged, &mut diagnostics);
         append_discovered_plugins(&mut merged_config.plugins, &inventory.plugin_files);
         merged_config.instructions =
             load_instruction_files(&merged_config.instructions, &project_root, &mut diagnostics);
@@ -811,12 +900,26 @@ fn load_custom_commands(
     sources: &[SourceFile],
     xdg_config_home: &Path,
     project_root: &Path,
+    plugins: &[PluginSpec],
     inventory: &mut ConfigInventory,
     diagnostics: &mut ConfigDiagnostics,
 ) -> Vec<crate::command::custom::CustomCommand> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut commands = Vec::new();
     let mut command_by_name: HashMap<String, usize> = HashMap::new();
+
+    // OpenCode packages can ship slash commands in `.opencode/command`. Load
+    // these first so user/project command definitions retain their usual
+    // higher precedence.
+    for dir in plugin_command_directories(plugins, project_root) {
+        for command in crate::command::custom::commands_from_directory(
+            &dir,
+            project_root,
+            &mut diagnostics.warnings,
+        ) {
+            upsert_custom_command(&mut commands, &mut command_by_name, command);
+        }
+    }
 
     for layer in command_layers(xdg_config_home, project_root, &home) {
         if let Some(source) = sources.iter().find(|source| source.label == layer.label) {
@@ -1119,6 +1222,7 @@ fn crabcode_allowed_keys() -> BTreeSet<&'static str> {
     out.insert("notifications");
     out.insert("images");
     out.insert("websearch");
+    out.insert("tui");
     out
 }
 
@@ -1415,6 +1519,12 @@ fn parse_merged_config(merged: &Value, diagnostics: &mut ConfigDiagnostics) -> M
             out.theme = Some(theme.trim().to_string());
         }
     }
+
+    out.tui_compact_mode = obj
+        .get("tui")
+        .and_then(Value::as_object)
+        .and_then(|tui| tui.get("compactMode").or_else(|| tui.get("compact_mode")))
+        .and_then(Value::as_bool);
 
     if let Some(Value::String(model)) = obj.get("model") {
         if !model.trim().is_empty() {
@@ -1777,7 +1887,7 @@ fn parse_websearch(value: Option<&Value>, diagnostics: &mut ConfigDiagnostics) -
                     match parse_websearch_provider(raw) {
                         Some(provider) => websearch.provider = provider,
                         _ => diagnostics.warnings.push(format!(
-                            "websearch.provider must be one of: exa-hosted-mcp, exa, tavily, perplexity, brave, ollama-cloud, serpapi, keiro; got {}",
+                            "websearch.provider must be one of: exa-hosted-mcp, firecrawl-hosted-mcp, exa, tavily, perplexity, brave, ollama-cloud, serpapi, keiro; got {}",
                             raw
                         )),
                     }
@@ -1836,6 +1946,7 @@ fn parse_websearch_provider(raw: &str) -> Option<WebsearchProvider> {
     let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
         "exa-hosted-mcp" => Some(WebsearchProvider::ExaHostedMcp),
+        "firecrawl-hosted-mcp" => Some(WebsearchProvider::FirecrawlHostedMcp),
         "exa" => Some(WebsearchProvider::Exa),
         "tavily" => Some(WebsearchProvider::Tavily),
         "perplexity" => Some(WebsearchProvider::Perplexity),
@@ -2698,6 +2809,7 @@ fn collect_unimplemented_keys(merged: &Value) -> Vec<String> {
         "notifications",
         "images",
         "websearch",
+        "tui",
         "instructions",
         "tools",
         "watcher",
@@ -2767,6 +2879,36 @@ mod tests {
         assert_eq!(config.plugins.len(), 1);
         assert_eq!(config.plugins[0].source, "./plugin.mjs");
         assert!(collect_unimplemented_keys(&filtered).is_empty());
+    }
+
+    #[test]
+    fn discovers_commands_shipped_by_a_local_plugin_package() {
+        let project = tempfile::tempdir().expect("project temp dir");
+        let package = project.path().join("node_modules/example-plugin");
+        let command_dir = package.join(".opencode/command");
+        std::fs::create_dir_all(&command_dir).unwrap();
+        std::fs::write(
+            command_dir.join("hello.md"),
+            "---\ndescription: Hello from plugin\n---\nSay hello to $ARGUMENTS",
+        )
+        .unwrap();
+
+        let plugins = vec![PluginSpec {
+            source: "example-plugin".to_string(),
+            options: Value::Null,
+        }];
+        let dirs = plugin_command_directories(&plugins, project.path());
+        assert_eq!(dirs, vec![package.join(".opencode")]);
+
+        let mut warnings = Vec::new();
+        let commands = crate::command::custom::commands_from_directory(
+            &dirs[0],
+            project.path(),
+            &mut warnings,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "hello");
     }
 
     #[test]
@@ -2880,6 +3022,24 @@ mod tests {
             config.small_model.as_deref(),
             Some("anthropic/claude-haiku")
         );
+    }
+
+    #[test]
+    fn parses_tui_compact_mode_aliases() {
+        let mut diagnostics = ConfigDiagnostics::default();
+        let config = parse_merged_config(
+            &json!({ "tui": { "compactMode": false } }),
+            &mut diagnostics,
+        );
+
+        assert_eq!(config.tui_compact_mode, Some(false));
+
+        let config = parse_merged_config(
+            &json!({ "tui": { "compact_mode": true } }),
+            &mut diagnostics,
+        );
+
+        assert_eq!(config.tui_compact_mode, Some(true));
     }
 
     #[test]
@@ -3088,6 +3248,10 @@ mod tests {
         assert_eq!(
             parse_websearch_provider("exa-hosted-mcp"),
             Some(WebsearchProvider::ExaHostedMcp)
+        );
+        assert_eq!(
+            parse_websearch_provider("firecrawl-hosted-mcp"),
+            Some(WebsearchProvider::FirecrawlHostedMcp)
         );
         assert_eq!(
             parse_websearch_provider("exa"),
