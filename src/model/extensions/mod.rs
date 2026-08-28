@@ -470,6 +470,7 @@ mod tests {
                 doc: String::new(),
                 env: vec!["CROF_API_KEY".to_string()],
                 npm: String::new(),
+                header: vec![],
                 models: HashMap::from([(
                     "greg-1-mini".to_string(),
                     Model {
@@ -532,6 +533,7 @@ mod tests {
                 doc: String::new(),
                 env: vec!["CROF_API_KEY".to_string()],
                 npm: String::new(),
+                header: vec![],
                 models: HashMap::from([(
                     "deepseek-v4-flash-0731".to_string(),
                     Model {

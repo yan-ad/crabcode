@@ -2897,13 +2897,14 @@ impl App {
         self.selection_action_bar.map(|state| match state.target {
             SelectionActionTarget::Chat => chat_selection_action_bar_area(
                 self.current_chat_area(),
-                self.chat_state.chat.scroll_offset,
+                self.chat_state.chat.resolved_scroll_offset(),
                 &self.chat_state.chat.selection,
                 state,
             ),
             SelectionActionTarget::Input => input_selection_action_bar_area(
                 self.last_frame_size,
                 self.suggestions_popup_anchor_area(),
+                self.input.selection_screen_row(),
             ),
         })
     }
@@ -4063,8 +4064,19 @@ impl App {
                         self.overlay_focus = OverlayFocus::None;
                         self.chat_state.chat.scroll_down(1);
                     }
-                    crate::views::which_key::WhichKeyAction::None => {
+                    crate::views::which_key::WhichKeyAction::ScrollToTop => {
                         self.overlay_focus = OverlayFocus::None;
+                        self.chat_state.chat.scroll_to_top();
+                    }
+                    crate::views::which_key::WhichKeyAction::ScrollToBottom => {
+                        self.overlay_focus = OverlayFocus::None;
+                        self.chat_state.chat.scroll_to_bottom();
+                    }
+                    crate::views::which_key::WhichKeyAction::None => {
+                        // Keep focus while which-key is still open (e.g. nested submenu).
+                        if !self.which_key_state.is_visible() {
+                            self.overlay_focus = OverlayFocus::None;
+                        }
                     }
                 }
                 true
@@ -9667,8 +9679,58 @@ impl App {
                             });
 
                         let call_id = call.id.clone();
-                        msg.add_tool_call_part(call.id, call.function.name, args_value);
-                        inserted.push((call_id, idx));
+                        // Upsert: hosted search may emit running then completed with same id.
+                        if let Some(existing) = msg.parts.iter_mut().find(|part| {
+                            part.part_type == "tool_call"
+                                && part.tool_id() == Some(call_id.as_str())
+                        }) {
+                            if let Some(obj) = existing.data.as_object_mut() {
+                                obj.insert(
+                                    "name".into(),
+                                    serde_json::Value::String(call.function.name.clone()),
+                                );
+                                // Hosted search completed events sometimes omit sources /
+                                // wipe query to ""; don't replace richer running args.
+                                let incoming_hollow =
+                                    crate::llm::client::hosted_search_args_are_hollow(&args_value);
+                                let existing_hollow = obj
+                                    .get("args")
+                                    .map(crate::llm::client::hosted_search_args_are_hollow)
+                                    .unwrap_or(true);
+                                if !incoming_hollow || existing_hollow {
+                                    obj.insert("args".into(), args_value);
+                                }
+                                if matches!(
+                                    call.function.name.as_str(),
+                                    "x_search" | "web_search" | "file_search"
+                                ) {
+                                    obj.insert(
+                                        "provider_executed".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                }
+                            }
+                        } else {
+                            msg.add_tool_call_part(
+                                call.id.clone(),
+                                call.function.name.clone(),
+                                args_value,
+                            );
+                            if matches!(
+                                call.function.name.as_str(),
+                                "x_search" | "web_search" | "file_search"
+                            ) {
+                                if let Some(part) = msg.parts.last_mut() {
+                                    if let Some(obj) = part.data.as_object_mut() {
+                                        obj.insert(
+                                            "provider_executed".into(),
+                                            serde_json::Value::Bool(true),
+                                        );
+                                    }
+                                }
+                            }
+                            inserted.push((call_id, idx));
+                        }
                     }
                     chat.mark_streaming_tool_render_pending(idx);
                 }
@@ -9716,6 +9778,12 @@ impl App {
                     };
                     v["id"] = serde_json::Value::String(result.tool_call_id.clone());
                     v["name"] = serde_json::Value::String(result.name.clone());
+                    if matches!(
+                        result.name.as_str(),
+                        "x_search" | "web_search" | "file_search"
+                    ) {
+                        v["provider_executed"] = serde_json::Value::Bool(true);
+                    }
 
                     if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&result.content)
                     {
@@ -9755,6 +9823,44 @@ impl App {
                         };
                         v["status"] = serde_json::Value::String(status.to_string());
                         v["output_preview"] = serde_json::Value::String(result.content.clone());
+                    }
+
+                    // Hosted search completed SSE often omits sources / clears query;
+                    // reuse running tool_call args for preview + result card header.
+                    if matches!(
+                        result.name.as_str(),
+                        "web_search" | "x_search" | "file_search"
+                    ) {
+                        if let Some(args) = msg
+                            .tool_call_part_data(&result.tool_call_id)
+                            .and_then(|part| part.get("args"))
+                            .filter(|a| !crate::llm::client::hosted_search_args_are_hollow(a))
+                            .cloned()
+                        {
+                            let result_args_hollow = v
+                                .get("args")
+                                .map(crate::llm::client::hosted_search_args_are_hollow)
+                                .unwrap_or(true);
+                            if result_args_hollow {
+                                v["args"] = args.clone();
+                            }
+
+                            let preview_is_stub = v
+                                .get("output_preview")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.trim().is_empty() || s.starts_with("Provider-executed "))
+                                .unwrap_or(true);
+                            if preview_is_stub {
+                                let enriched = crate::llm::client::hosted_search_output_preview(
+                                    &result.name,
+                                    v.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+                                    &serde_json::json!({ "arguments": args }),
+                                );
+                                if !enriched.starts_with("Provider-executed ") {
+                                    v["output_preview"] = serde_json::Value::String(enriched);
+                                }
+                            }
+                        }
                     }
 
                     if msg.role == crate::session::types::MessageRole::Assistant {
@@ -11093,14 +11199,16 @@ impl App {
         if let Some(state) = self.selection_action_bar {
             let area = match state.target {
                 SelectionActionTarget::Chat => chat_selection_action_bar_area(
-                    self.chat_area_for_size(size),
-                    self.chat_state.chat.scroll_offset,
+                    self.current_chat_area(),
+                    self.chat_state.chat.resolved_scroll_offset(),
                     &self.chat_state.chat.selection,
                     state,
                 ),
-                SelectionActionTarget::Input => {
-                    input_selection_action_bar_area(size, self.suggestions_popup_anchor_area())
-                }
+                SelectionActionTarget::Input => input_selection_action_bar_area(
+                    size,
+                    self.suggestions_popup_anchor_area(),
+                    self.input.selection_screen_row(),
+                ),
             };
             render_selection_action_bar(f, area, state, &colors);
         }
@@ -11164,9 +11272,16 @@ fn chat_selection_action_bar_area(
         height: chat_area.height,
     };
     let ((start_line, start_col), (end_line, _)) = selection.range();
+    // Stick-to-bottom stores `scroll_offset = usize::MAX`. Resolve it here too so
+    // the bar still anchors to the selection if a caller forgets.
+    let visible_start = if scroll_offset == usize::MAX {
+        start_line.saturating_sub(content_area.height.saturating_sub(1) as usize)
+    } else {
+        scroll_offset
+    };
     selection_action_bar_area_for_anchor(
         content_area,
-        scroll_offset,
+        visible_start,
         start_line,
         end_line,
         start_col,
@@ -11174,8 +11289,13 @@ fn chat_selection_action_bar_area(
     )
 }
 
-fn input_selection_action_bar_area(frame_area: Rect, input_area: Rect) -> Rect {
-    let y = input_area.y.saturating_sub(1);
+fn input_selection_action_bar_area(
+    frame_area: Rect,
+    input_area: Rect,
+    selection_row: Option<u16>,
+) -> Rect {
+    // Prefer one row above the selection; fall back to one above the input box.
+    let y = selection_row.unwrap_or(input_area.y).saturating_sub(1);
     let x = input_area.x.saturating_add(1);
     clamp_action_bar_area(
         frame_area,
@@ -12136,6 +12256,45 @@ mod tests {
             selection_action_for_column(input, 8),
             SelectionAction::Dismiss
         );
+    }
+
+    #[test]
+    fn chat_selection_action_bar_anchors_near_selection_when_stuck_to_bottom() {
+        let chat_area = Rect::new(0, 0, 80, 20);
+        let selection = crate::ui::selection::Selection {
+            active: true,
+            start_line: 100,
+            start_col: 4,
+            end_line: 100,
+            end_col: 10,
+            is_dragging: false,
+            anchor: None,
+        };
+        let state = SelectionActionBarState {
+            target: SelectionActionTarget::Chat,
+            can_open_in_editor: false,
+        };
+
+        // Stick-to-bottom sentinel must resolve instead of pinning to the top.
+        let stuck = chat_selection_action_bar_area(chat_area, usize::MAX, &selection, state);
+        assert_eq!(stuck.y, chat_area.y + 18);
+        assert!(stuck.y > chat_area.y + 10);
+
+        // Explicit resolved scroll (selection near bottom of viewport) matches.
+        let resolved_start = 100usize.saturating_sub(19);
+        let area = chat_selection_action_bar_area(chat_area, resolved_start, &selection, state);
+        assert_eq!(area.y, chat_area.y + 18); // one above last viewport row
+        assert_eq!(area.y, stuck.y);
+    }
+
+    #[test]
+    fn input_selection_action_bar_anchors_above_selection_row() {
+        let frame = Rect::new(0, 0, 80, 24);
+        let input_area = Rect::new(2, 18, 40, 4);
+        let area = input_selection_action_bar_area(frame, input_area, Some(20));
+        assert_eq!(area.y, 19);
+        let fallback = input_selection_action_bar_area(frame, input_area, None);
+        assert_eq!(fallback.y, 17);
     }
 
     #[test]
