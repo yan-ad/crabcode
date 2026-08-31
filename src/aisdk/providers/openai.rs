@@ -1545,12 +1545,10 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
                 return Some(Ok(responses_error_chunk(&value, event_type)));
             }
             let resp = &value["response"];
-            if let Some(usage) = resp.get("usage") {
-                log_openai_responses_usage(usage);
-            }
             Some(Ok(ChunkType::ResponseCompleted {
                 end_turn: resp.get("end_turn").and_then(|value| value.as_bool()),
                 reasoning_items: reasoning_items_from_response_output(resp),
+                usage: resp.get("usage").and_then(openai_responses_usage),
             }))
         }
         // Grok Build / cli-chat-proxy: `response.doom_loop_check` with
@@ -1593,7 +1591,7 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
 
 /// Log Responses API usage for prompt-cache visibility.
 /// Looks for `input_tokens_details.cached_tokens` (OpenAI/xAI shape).
-fn log_openai_responses_usage(usage: &serde_json::Value) {
+fn openai_responses_usage(usage: &serde_json::Value) -> Option<crate::chunk::TokenUsage> {
     let input = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
@@ -1610,7 +1608,7 @@ fn log_openai_responses_usage(usage: &serde_json::Value) {
         .unwrap_or(0);
 
     if input.is_none() && output.is_none() && cached == 0 {
-        return;
+        return None;
     }
 
     let input_v = input.unwrap_or(0);
@@ -1627,6 +1625,13 @@ fn log_openai_responses_usage(usage: &serde_json::Value) {
         cached,
         hit_pct
     ));
+
+    Some(crate::chunk::TokenUsage {
+        input: input_v.saturating_sub(cached),
+        output: output.unwrap_or(0),
+        cache_read: cached,
+        cache_write: 0,
+    })
 }
 
 fn responses_provider_error_message(value: &serde_json::Value, fallback: &str) -> String {
