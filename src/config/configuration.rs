@@ -407,6 +407,16 @@ impl Default for ImagesConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditorConfig {
+    /// Shell template used when a file path is clicked. Placeholders:
+    /// `{pathname}` / `{path}` / `{filename}` (shell-quoted), `{pathname_raw}`,
+    /// `{line}`, `{column}` / `{col}`, `{location}` (quoted `path:line:column`).
+    pub open: Option<String>,
+    /// Leave the TUI, run `open` with the terminal, then restore crabcode.
+    pub suspend: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebsearchProvider {
     ExaHostedMcp,
@@ -420,6 +430,8 @@ pub enum WebsearchProvider {
     Keiro,
     Parallel,
     Tako,
+    Tinyfish,
+    Monid,
 }
 
 impl WebsearchProvider {
@@ -436,6 +448,8 @@ impl WebsearchProvider {
             Self::Keiro => "keiro",
             Self::Parallel => "parallel",
             Self::Tako => "tako",
+            Self::Tinyfish => "tinyfish",
+            Self::Monid => "monid",
         }
     }
 }
@@ -612,6 +626,7 @@ pub struct MergedConfig {
     pub custom_providers: HashMap<String, CustomProviderConfig>,
     pub notifications: NotificationsConfig,
     pub images: ImagesConfig,
+    pub editor: EditorConfig,
     pub websearch: WebsearchConfig,
     pub mcp: McpConfig,
     pub instructions: Vec<String>,
@@ -1254,6 +1269,7 @@ fn crabcode_allowed_keys() -> BTreeSet<&'static str> {
     out.insert("theme");
     out.insert("notifications");
     out.insert("images");
+    out.insert("editor");
     out.insert("websearch");
     out.insert("tui");
     out
@@ -1613,6 +1629,7 @@ fn parse_merged_config(merged: &Value, diagnostics: &mut ConfigDiagnostics) -> M
     apply_notifications(obj.get("notifications"), &mut notifications, diagnostics);
     out.notifications = notifications;
     out.images = parse_images(obj.get("images"), diagnostics);
+    out.editor = parse_editor(obj.get("editor"), diagnostics);
     out.websearch = parse_websearch(obj.get("websearch"), diagnostics);
     out.mcp = parse_mcp(obj.get("mcp"), diagnostics);
     out.instructions = obj
@@ -1835,8 +1852,9 @@ fn parse_mcp_oauth(
     };
     (
         true,
-        optional_string(map.get("clientId")),
-        optional_string(map.get("clientSecret")),
+        optional_string(map.get("clientId")).or_else(|| optional_string(map.get("client_id"))),
+        optional_string(map.get("clientSecret"))
+            .or_else(|| optional_string(map.get("client_secret"))),
         optional_string(map.get("scope")),
     )
 }
@@ -1948,7 +1966,7 @@ fn parse_websearch(value: Option<&Value>, diagnostics: &mut ConfigDiagnostics) -
                     match parse_websearch_provider(raw) {
                         Some(provider) => websearch.provider = provider,
                         _ => diagnostics.warnings.push(format!(
-                            "websearch.provider must be one of: exa-hosted-mcp, firecrawl-hosted-mcp, exa, tavily, perplexity, brave, ollama-cloud, serpapi, keiro, parallel, tako; got {}",
+                            "websearch.provider must be one of: exa-hosted-mcp, firecrawl-hosted-mcp, exa, tavily, perplexity, brave, ollama-cloud, serpapi, keiro, parallel, tako, tinyfish, monid; got {}",
                             raw
                         )),
                     }
@@ -2017,6 +2035,8 @@ fn parse_websearch_provider(raw: &str) -> Option<WebsearchProvider> {
         "keiro" => Some(WebsearchProvider::Keiro),
         "parallel" => Some(WebsearchProvider::Parallel),
         "tako" => Some(WebsearchProvider::Tako),
+        "tinyfish" => Some(WebsearchProvider::Tinyfish),
+        "monid" => Some(WebsearchProvider::Monid),
         _ => None,
     }
 }
@@ -2555,6 +2575,55 @@ fn parse_image_open_with(
     }
 }
 
+fn parse_editor(value: Option<&Value>, diagnostics: &mut ConfigDiagnostics) -> EditorConfig {
+    let mut editor = EditorConfig::default();
+    let Some(value) = value else {
+        return editor;
+    };
+    if value.is_null() {
+        return editor;
+    }
+
+    match value {
+        Value::String(open) => {
+            let open = open.trim();
+            if !open.is_empty() {
+                editor.open = Some(open.to_string());
+            }
+        }
+        Value::Object(map) => {
+            if let Some(open) = map.get("open") {
+                match open {
+                    Value::String(open) => {
+                        let open = open.trim();
+                        if !open.is_empty() {
+                            editor.open = Some(open.to_string());
+                        }
+                    }
+                    Value::Null => {}
+                    _ => diagnostics
+                        .warnings
+                        .push("editor.open must be a string".to_string()),
+                }
+            }
+
+            if let Some(suspend) = map.get("suspend") {
+                match suspend {
+                    Value::Bool(suspend) => editor.suspend = *suspend,
+                    _ => diagnostics
+                        .warnings
+                        .push("editor.suspend must be a boolean".to_string()),
+                }
+            }
+        }
+        _ => diagnostics
+            .warnings
+            .push("editor must be a string or object".to_string()),
+    }
+
+    editor
+}
+
 fn apply_notifications(
     value: Option<&Value>,
     notifications: &mut NotificationsConfig,
@@ -2871,6 +2940,7 @@ fn collect_unimplemented_keys(merged: &Value) -> Vec<String> {
         "enabledProviders",
         "notifications",
         "images",
+        "editor",
         "websearch",
         "tui",
         "instructions",
@@ -3376,6 +3446,14 @@ mod tests {
             parse_websearch_provider("tako"),
             Some(WebsearchProvider::Tako)
         );
+        assert_eq!(
+            parse_websearch_provider("tinyfish"),
+            Some(WebsearchProvider::Tinyfish)
+        );
+        assert_eq!(
+            parse_websearch_provider("monid"),
+            Some(WebsearchProvider::Monid)
+        );
         assert_eq!(parse_websearch_provider("ollama"), None);
         assert_eq!(parse_websearch_provider("keiro-labs"), None);
         assert_eq!(parse_websearch_provider("keirolabs"), None);
@@ -3511,6 +3589,43 @@ mod tests {
         let config = parse_merged_config(&json!({}), &mut diagnostics);
 
         assert_eq!(config.images.open_with, ImageOpenWith::Auto);
+        assert_eq!(config.editor, EditorConfig::default());
+        assert!(diagnostics.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_editor_open_string() {
+        let mut diagnostics = ConfigDiagnostics::default();
+        let config = parse_merged_config(
+            &json!({
+                "editor": "hx -- {pathname}:{line}:{column}"
+            }),
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            config.editor.open.as_deref(),
+            Some("hx -- {pathname}:{line}:{column}")
+        );
+        assert!(!config.editor.suspend);
+        assert!(diagnostics.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_editor_open_object() {
+        let mut diagnostics = ConfigDiagnostics::default();
+        let config = parse_merged_config(
+            &json!({
+                "editor": {
+                    "open": "hx -- {location}",
+                    "suspend": true
+                }
+            }),
+            &mut diagnostics,
+        );
+
+        assert_eq!(config.editor.open.as_deref(), Some("hx -- {location}"));
+        assert!(config.editor.suspend);
         assert!(diagnostics.warnings.is_empty());
     }
 
@@ -3753,5 +3868,56 @@ mod tests {
             resolve_api_key_value(Some("{env:MISSING_KEY}"), |_| None),
             None
         );
+    }
+
+    #[test]
+    fn parses_remote_mcp_oauth_camel_and_snake_case() {
+        let mut diagnostics = ConfigDiagnostics::default();
+        let config = parse_merged_config(
+            &json!({
+                "mcp": {
+                    "doop": {
+                        "type": "remote",
+                        "url": "https://doop.design/mcp",
+                        "oauth": {
+                            "clientId": "camel",
+                            "client_secret": "snake",
+                            "scope": "openid"
+                        }
+                    },
+                    "plain": {
+                        "url": "https://mcp.grep.app"
+                    },
+                    "disabled": {
+                        "url": "https://example.com/mcp",
+                        "oauth": false
+                    }
+                }
+            }),
+            &mut diagnostics,
+        );
+
+        let doop = match config.mcp.get("doop") {
+            Some(McpServerConfig::Remote(remote)) => remote,
+            other => panic!("expected remote doop, got {other:?}"),
+        };
+        assert!(doop.oauth_enabled);
+        assert_eq!(doop.oauth_client_id.as_deref(), Some("camel"));
+        assert_eq!(doop.oauth_client_secret.as_deref(), Some("snake"));
+        assert_eq!(doop.oauth_scope.as_deref(), Some("openid"));
+
+        let plain = match config.mcp.get("plain") {
+            Some(McpServerConfig::Remote(remote)) => remote,
+            other => panic!("expected remote plain, got {other:?}"),
+        };
+        assert!(plain.oauth_enabled);
+        assert!(plain.oauth_client_id.is_none());
+
+        let disabled = match config.mcp.get("disabled") {
+            Some(McpServerConfig::Remote(remote)) => remote,
+            other => panic!("expected remote disabled, got {other:?}"),
+        };
+        assert!(!disabled.oauth_enabled);
+        assert!(diagnostics.warnings.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-use crate::chunk::{ChunkType, MessagePhase};
+use crate::chunk::{ChunkType, MessagePhase, ReasoningReplayItem};
 use crate::error::{Error, Result};
 use crate::message::{is_prefixed_response_item_id, Message};
 use crate::provider::{Provider, ProviderStream};
@@ -300,7 +300,10 @@ impl WebsocketStreamProgress {
     fn record_chunk(&mut self, chunk: &ChunkType) {
         if matches!(
             chunk,
-            ChunkType::Text(_) | ChunkType::Reasoning(_) | ChunkType::ToolCall(_)
+            ChunkType::Text(_)
+                | ChunkType::Reasoning(_)
+                | ChunkType::ReasoningItem(_)
+                | ChunkType::ToolCall(_)
         ) {
             self.emitted_non_replayable_output = true;
         }
@@ -424,6 +427,19 @@ impl Provider for OpenAI {
 
         let request_diagnostics =
             openai_request_diagnostics(self, &input, tools, &body, &request_headers);
+
+        if let Ok(dir) = std::env::var("CRABCODE_DUMP_REQUEST_DIR") {
+            let path = std::path::PathBuf::from(dir).join(format!(
+                "openai-responses-{}.json",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default()
+            ));
+            if let Ok(pretty) = serde_json::to_string_pretty(&body) {
+                let _ = std::fs::write(&path, pretty);
+            }
+        }
 
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(
@@ -639,11 +655,8 @@ impl OpenAI {
             "model": self.model_name,
             "input": input,
             "stream": true,
-            "include": if self.responses_lite {
-                serde_json::json!(["reasoning.encrypted_content"])
-            } else {
-                serde_json::json!([])
-            },
+            // Responses only returns `encrypted_content` when this include is set.
+            "include": serde_json::json!(["reasoning.encrypted_content"]),
         });
 
         if self.responses_lite {
@@ -1537,14 +1550,33 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
             }
             Some(Ok(ChunkType::ResponseCompleted {
                 end_turn: resp.get("end_turn").and_then(|value| value.as_bool()),
+                reasoning_items: reasoning_items_from_response_output(resp),
             }))
+        }
+        // Grok Build / cli-chat-proxy: `response.doom_loop_check` with
+        // `doom_loop_check.triggers` like `tail_repetition:8@thinking`.
+        // `.devrefs/references/xai-org/grok-build/crates/codegen/xai-grok-sampler/src/doom_loop.rs`
+        "response.doom_loop_check" => {
+            let triggers = value
+                .pointer("/doom_loop_check/triggers")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(Ok(ChunkType::Metadata(format!(
+                "doom_loop_check triggers={triggers}"
+            ))))
         }
         "response.incomplete" => Some(Ok(ChunkType::RetryableFailure(RetryError::from_message(
             responses_incomplete_message(&value),
         )))),
         "response.failed" | "error" => Some(Ok(responses_error_chunk(&value, event_type))),
         _ => {
-            if let Some(message_phase) = responses_assistant_message_phase_chunk(&value) {
+            if let Some(reasoning_item) = responses_reasoning_item_chunk(&value) {
+                Some(Ok(ChunkType::ReasoningItem(reasoning_item)))
+            } else if let Some(message_phase) = responses_assistant_message_phase_chunk(&value) {
                 Some(Ok(message_phase))
             } else if let Some(payload) = responses_hosted_search_chunk(&value) {
                 // Provider-executed hosted search — UI only, never client execute.
@@ -1768,6 +1800,114 @@ fn parse_message_phase(phase: &str) -> Option<MessagePhase> {
     }
 }
 
+fn responses_reasoning_item_chunk(value: &serde_json::Value) -> Option<ReasoningReplayItem> {
+    let event_type = value.get("type").and_then(|v| v.as_str())?;
+    if !matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
+        return None;
+    }
+    reasoning_replay_from_output_item(value.get("item")?)
+}
+
+fn reasoning_items_from_response_output(response: &serde_json::Value) -> Vec<ReasoningReplayItem> {
+    response
+        .get("output")
+        .and_then(|output| output.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(reasoning_replay_from_output_item)
+        .collect()
+}
+
+fn reasoning_replay_from_output_item(item: &serde_json::Value) -> Option<ReasoningReplayItem> {
+    if item.get("type").and_then(|v| v.as_str()) != Some("reasoning") {
+        return None;
+    }
+    let id = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let encrypted_content = item
+        .get("encrypted_content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(str::to_string);
+    let summary = reasoning_summary_text(item);
+    let item = ReasoningReplayItem {
+        id,
+        summary,
+        encrypted_content,
+    };
+    (!item.is_empty()).then_some(item)
+}
+
+fn reasoning_summary_text(item: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(summary) = item.get("summary").and_then(|value| value.as_array()) {
+        for part in summary {
+            if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    if let Some(content) = item.get("content").and_then(|value| value.as_array()) {
+        for part in content {
+            if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn responses_reasoning_input_item(
+    reasoning: &crate::message::ReasoningMessage,
+) -> Option<serde_json::Value> {
+    if reasoning.is_empty() {
+        return None;
+    }
+    let mut item = serde_json::json!({
+        "type": "reasoning",
+        "summary": reasoning_summary_parts(&reasoning.summary),
+    });
+    if let Some(id) = reasoning
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        item["id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(encrypted) = reasoning
+        .encrypted_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    {
+        item["encrypted_content"] = serde_json::Value::String(encrypted.to_string());
+    }
+    Some(item)
+}
+
+fn reasoning_summary_parts(summary: &str) -> serde_json::Value {
+    if summary.is_empty() {
+        return serde_json::json!([]);
+    }
+    serde_json::json!([{
+        "type": "summary_text",
+        "text": summary,
+    }])
+}
+
 /// True when an SSE event type is a provider-hosted search lifecycle event.
 fn is_hosted_search_event(event_type: &str) -> bool {
     let lower = event_type.to_ascii_lowercase();
@@ -1816,6 +1956,21 @@ fn hosted_search_status_from_event(event_type: &str) -> &'static str {
     } else {
         "running"
     }
+}
+
+/// Collapse xAI dual SSE id namespaces onto one tool-call id.
+///
+/// `x_search` emits both:
+/// - `response.output_item.*` with `item.id` like `xs_call-<uuid>-N`
+/// - `response.custom_tool_call_input.*` with `item_id` like `ctc_<uuid>_call-<uuid>-N`
+///
+/// Those share the `call-<uuid>-N` suffix; without normalizing, the UI paints
+/// two cards for one provider-executed search.
+fn normalize_hosted_search_tool_id(id: &str) -> String {
+    if let Some(idx) = id.find("call-") {
+        return id[idx..].to_string();
+    }
+    id.to_string()
 }
 
 /// Build a display-only ProviderToolCall payload from hosted-search SSE.
@@ -1869,14 +2024,17 @@ fn responses_hosted_search_chunk(value: &serde_json::Value) -> Option<String> {
         return None;
     }
 
+    // Prefer call_id (shared across event families) over item_id / item.id
+    // (`ctc_*` vs `xs_*` namespaces), then strip prefixes to the shared suffix.
     let id = item
         .get("call_id")
+        .or_else(|| value.get("call_id"))
         .or_else(|| item.get("id"))
         .or_else(|| value.get("item_id"))
         .or_else(|| value.get("id"))
         .and_then(|v| v.as_str())
-        .unwrap_or("hosted_search")
-        .to_string();
+        .map(normalize_hosted_search_tool_id)
+        .unwrap_or_else(|| "hosted_search".to_string());
 
     let status = if event_type == "response.output_item.done" {
         "completed"
@@ -2089,6 +2247,7 @@ fn build_openai_messages(
                         "content": a.content,
                     })
                 }),
+                Message::Reasoning(r) => responses_reasoning_input_item(r),
                 Message::ToolCall(t) => {
                     let mut item = serde_json::json!({
                         "type": "function_call",
@@ -2153,6 +2312,9 @@ fn openai_responses_user_content(user: &crate::message::UserMessage) -> serde_js
         serde_json::json!({
             "type": "input_image",
             "image_url": image.data_url,
+            // xAI Build / Responses requires `detail`; omitting it can yield
+            // successful responses that ignore the image (hallucinated vision).
+            "detail": "auto",
         })
     }));
     serde_json::Value::Array(parts)
@@ -2174,6 +2336,7 @@ fn openai_tool_output_content(tool: &crate::message::ToolOutputMessage) -> serde
         serde_json::json!({
             "type": "input_image",
             "image_url": image.data_url,
+            "detail": "auto",
         })
     }));
     serde_json::Value::Array(parts)
@@ -2266,7 +2429,8 @@ mod tests {
         assert!(matches!(
             chunk,
             Ok(ChunkType::ResponseCompleted {
-                end_turn: Some(false)
+                end_turn: Some(false),
+                ..
             })
         ));
     }
@@ -2480,6 +2644,55 @@ mod tests {
     }
 
     #[test]
+    fn collapses_x_search_dual_sse_id_namespaces() {
+        // xAI emits both output_item (xs_*) and custom_tool_call_input (ctc_*).
+        // They must share one tool id so the UI paints a single card.
+        let shared = "call-aadee343-63eb-9a1b-8000-0b77246e7421-21";
+        let output_item = response_sse_data_to_chunk(
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "id": format!("xs_{shared}"),
+                    "type": "custom_tool_call",
+                    "name": "x_search",
+                    "status": "in_progress",
+                    "arguments": {"post_id": "2093050916953903451"}
+                }
+            })
+            .to_string(),
+        );
+        let custom_input = response_sse_data_to_chunk(
+            &serde_json::json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": format!("ctc_f47ac10b-58cc-4372-a567-0e02b2c3d479_{shared}"),
+                "delta": "{\"post_id\":\"2093050916953903451\"}"
+            })
+            .to_string(),
+        );
+
+        let id_from = |chunk: Option<Result<ChunkType, _>>| -> String {
+            match chunk {
+                Some(Ok(ChunkType::ProviderToolCall(payload))) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&payload).expect("valid payload");
+                    parsed["id"].as_str().unwrap().to_string()
+                }
+                other => panic!("expected ProviderToolCall, got {other:?}"),
+            }
+        };
+
+        let a = id_from(output_item);
+        let b = id_from(custom_input);
+        assert_eq!(a, shared);
+        assert_eq!(b, shared);
+        assert_eq!(
+            super::normalize_hosted_search_tool_id("ws_1"),
+            "ws_1",
+            "ids without call- suffix stay unchanged"
+        );
+    }
+
+    #[test]
     fn maps_responses_function_call_item_to_tool_call_shape() {
         let event = serde_json::json!({
             "type": "response.output_item.added",
@@ -2571,6 +2784,29 @@ mod tests {
         assert_eq!(output[0]["type"], "input_text");
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,AAA");
+        assert_eq!(output[1]["detail"], "auto");
+    }
+
+    #[test]
+    fn serializes_user_image_input_with_detail_for_responses() {
+        let input = build_openai_messages(
+            &[Message::user_with_images(
+                "what is this?",
+                vec![crate::message::ImageContent {
+                    data_url: "data:image/png;base64,AAA".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+            )],
+            false,
+            false,
+        );
+
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"].as_array().expect("content items");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAA");
+        assert_eq!(content[1]["detail"], "auto");
     }
 
     #[test]
@@ -2611,6 +2847,101 @@ mod tests {
 
         assert_eq!(body["prompt_cache_key"], "session-abc");
         assert_eq!(body["store"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn responses_body_always_includes_encrypted_reasoning() {
+        let provider = OpenAI::builder()
+            .base_url("https://api.openai.com")
+            .api_key("test-key")
+            .model_name("gpt-test")
+            .build()
+            .unwrap();
+
+        let body = provider.build_responses_body(
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            &[],
+        );
+
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn responses_input_replays_reasoning_item_with_encrypted_content() {
+        let input = build_openai_messages(
+            &[
+                Message::user("inspect"),
+                Message::reasoning(
+                    Some("rs_1".to_string()),
+                    "inspect the file",
+                    Some("enc_abc".to_string()),
+                ),
+                Message::tool_call("call_1", "read", r#"{"file_path":"src/lib.rs"}"#),
+            ],
+            false,
+            false,
+        );
+
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_1");
+        assert_eq!(input[1]["encrypted_content"], "enc_abc");
+        assert_eq!(input[1]["summary"][0]["text"], "inspect the file");
+        assert_eq!(input[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn response_completed_captures_encrypted_reasoning_items() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.completed","response":{"output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"enc_abc"},{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}]}}"#,
+        )
+        .expect("expected terminal chunk");
+
+        match chunk {
+            Ok(ChunkType::ResponseCompleted {
+                reasoning_items, ..
+            }) => {
+                assert_eq!(reasoning_items.len(), 1);
+                assert_eq!(reasoning_items[0].id.as_deref(), Some("rs_1"));
+                assert_eq!(
+                    reasoning_items[0].encrypted_content.as_deref(),
+                    Some("enc_abc")
+                );
+                assert_eq!(reasoning_items[0].summary, "plan");
+            }
+            other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doom_loop_check_sse_becomes_metadata() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}"#,
+        )
+        .expect("expected metadata chunk");
+        match chunk {
+            Ok(ChunkType::Metadata(message)) => {
+                assert!(message.contains("doom_loop_check"));
+                assert!(message.contains("tail_repetition:8@thinking"));
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_item_done_emits_reasoning_item_chunk() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc_abc"}}"#,
+        )
+        .expect("expected reasoning item chunk");
+
+        match chunk {
+            Ok(ChunkType::ReasoningItem(item)) => {
+                assert_eq!(item.id.as_deref(), Some("rs_1"));
+                assert_eq!(item.encrypted_content.as_deref(), Some("enc_abc"));
+            }
+            other => panic!("expected ReasoningItem, got {other:?}"),
+        }
     }
 
     #[test]
