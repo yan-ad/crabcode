@@ -15,8 +15,20 @@ permissions:
   contents: write
 
 jobs:
+  version:
+    name: Generate timestamp version
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Generate UTC timestamp version
+        id: version
+        shell: bash
+        run: echo "value=0.0.4$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +54,7 @@ jobs:
           bun run build
 
       - name: Build Crabcode
-        run: CRABCODE_VERSION="0.0.${GITHUB_RUN_ID}" cargo build --release --locked
+        run: CRABCODE_VERSION="${{ needs.version.outputs.value }}" cargo build --release --locked
 
       - name: Package preview archive
         shell: bash
@@ -65,7 +77,9 @@ jobs:
 
   release:
     name: Publish preview release
-    needs: build
+    needs:
+      - version
+      - build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -78,7 +92,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: gondescode-${{ github.sha }}
           SHORT_SHA: ${{ github.sha }}
-          VERSION: 0.0.${{ github.run_id }}
+          VERSION: ${{ needs.version.outputs.value }}
         run: |
           cat > release-notes.md <<EOF
           Automated preview build \`v${VERSION}\` from \`yan-flavor\` at \`${SHORT_SHA}\`.
