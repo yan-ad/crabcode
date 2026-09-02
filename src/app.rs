@@ -11580,6 +11580,8 @@ impl App {
                 let subagent_tabs = self.subagent_tabs_for_current_session();
                 let queued_messages = self.queued_message_previews_for_current_session();
                 let (display_agent, display_model) = self.current_session_agent_model_for_display();
+                let display_model_name =
+                    self.model_name_for_display(&self.provider_name, &display_model);
                 let retry_status = self.current_session_retry_status();
                 let below_chat = self.dialog_below_chat_height(size);
                 let scroll_padding = if self.overlay_focus == OverlayFocus::QuestionDialog
@@ -11610,6 +11612,7 @@ impl App {
                     branch,
                     display_agent,
                     display_model,
+                    display_model_name,
                     self.provider_name.clone(),
                     reasoning_effort,
                     &colors,

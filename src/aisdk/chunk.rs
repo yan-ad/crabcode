@@ -74,6 +74,7 @@ impl ChunkType {
         Self::ResponseCompleted {
             end_turn,
             reasoning_items: Vec::new(),
+            doom_loop_triggers: Vec::new(),
             usage: None,
         }
     }
