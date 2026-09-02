@@ -2072,7 +2072,7 @@ async fn relay_stream_to_sender(
                 crate::emit_log!("[RELAY] Metadata {}", message);
             }
             ChunkType::Usage(usage) => {
-                stream_usage = Some(usage);
+                stream_usage = combined_usage(stream_usage, Some(usage));
                 crate::emit_log!(
                     "[RELAY] Usage input={} output={} cache_read={} cache_write={}",
                     usage.input_tokens,
@@ -2080,6 +2080,9 @@ async fn relay_stream_to_sender(
                     usage.cache_read_tokens,
                     usage.cache_write_tokens,
                 );
+                if let Some(usage) = stream_usage {
+                    let _ = sender.send(crate::llm::ChunkMessage::Usage(usage));
+                }
             }
             ChunkType::Retry(status) => {
                 let elapsed_ms = start_time.elapsed().as_millis();

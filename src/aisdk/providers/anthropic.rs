@@ -977,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn message_start_usage_is_not_emitted_or_double_counted() {
+    fn message_start_emits_input_usage() {
         let value = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -990,7 +990,16 @@ mod tests {
             },
         });
 
-        assert!(anthropic_stream_chunks("message_start", &value).is_empty());
+        let chunks = anthropic_stream_chunks("message_start", &value);
+        assert!(matches!(
+            chunks.as_slice(),
+            [Ok(ChunkType::Usage(crate::chunk::LanguageModelUsage {
+                input_tokens: 19,
+                output_tokens: 0,
+                cache_read_tokens: 5,
+                cache_write_tokens: 2,
+            }))]
+        ));
     }
 
     #[test]
