@@ -19,6 +19,7 @@ pub enum ChunkType {
     ResponseCompleted {
         end_turn: Option<bool>,
         reasoning_items: Vec<ReasoningReplayItem>,
+        doom_loop_triggers: Vec<String>,
         usage: Option<TokenUsage>,
     },
     Retry(crate::retry::RetryStatus),

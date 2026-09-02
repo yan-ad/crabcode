@@ -262,9 +262,9 @@ fn core_palette_items(
         ),
         (
             "copy",
-            "Copy Session Transcript",
+            "Copy",
             "Workspace",
-            "Copy the current transcript",
+            "Copy provider/model id or session details",
         ),
         (
             "compact",
@@ -291,6 +291,12 @@ fn core_palette_items(
             "Return to a blank home screen",
         ),
         ("models", "Change Model", "Model", "Choose the active model"),
+        (
+            "variants",
+            "Switch model variant",
+            "Model",
+            "Choose reasoning effort for the active model",
+        ),
         (
             "connect",
             "Connect Provider",
@@ -320,6 +326,12 @@ fn core_palette_items(
             "Configure Terminal Title",
             "Appearance",
             "Choose and reorder terminal title items",
+        ),
+        (
+            "status",
+            "Status",
+            "Application",
+            "Show MCP, formatter, and plugin status",
         ),
         ("exit", "Quit Crabcode", "Application", "Exit the app"),
     ] {
@@ -447,11 +459,11 @@ fn core_palette_items(
             .unwrap_or(items.len()),
         app_action_item(
             "cycle-reasoning-effort",
-            "Cycle Reasoning Effort",
+            "Variant Cycle",
             "Model",
-            "Switch reasoning effort for the active model",
+            "Cycle reasoning effort for the active model",
             Some("ctrl+t"),
-            &[],
+            &["reasoning effort", "cycle reasoning effort"],
         ),
     );
 
@@ -619,7 +631,7 @@ mod tests {
         state.refresh_items(&registry, false, true, false);
 
         assert!(state.dialog.items.iter().any(|item| item.id == "models"));
-        assert!(!state.dialog.items.iter().any(|item| item.id == "copy"));
+        assert!(state.dialog.items.iter().any(|item| item.id == "copy"));
         assert!(!state.dialog.items.iter().any(|item| item.id == "fork"));
         assert!(!state
             .dialog
@@ -826,6 +838,62 @@ mod tests {
             action_for_item(&item),
             CommandPaletteAction::RunAppAction(CommandPaletteAppAction::OpenFind)
         );
+    }
+
+    #[test]
+    fn palette_includes_variants_and_status_commands() {
+        let mut registry = Registry::new();
+        register_all_commands(&mut registry);
+        let mut state = init_command_palette();
+
+        state.refresh_items(&registry, false, true, false);
+
+        let variants = state
+            .dialog
+            .items
+            .iter()
+            .find(|item| item.id == "variants")
+            .expect("variants should be listed");
+        assert_eq!(variants.name, "Switch model variant");
+        assert_eq!(variants.group, "Model");
+        assert_eq!(
+            action_for_item(variants),
+            CommandPaletteAction::RunCommand("variants".to_string())
+        );
+
+        let status = state
+            .dialog
+            .items
+            .iter()
+            .find(|item| item.id == "status")
+            .expect("status should be listed");
+        assert_eq!(status.name, "Status");
+        assert_eq!(status.group, "Application");
+        assert_eq!(
+            action_for_item(status),
+            CommandPaletteAction::RunCommand("status".to_string())
+        );
+    }
+
+    #[test]
+    fn palette_search_matches_reasoning_effort_for_variant_actions() {
+        let mut registry = Registry::new();
+        register_all_commands(&mut registry);
+        let mut state = init_command_palette();
+
+        state.refresh_items(&registry, false, true, false);
+        state.dialog.set_search_query("reasoning effort");
+
+        let matches = state
+            .dialog
+            .filtered_items
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .map(|item| (item.id.as_str(), item.name.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(matches.contains(&("variants", "Switch model variant")));
+        assert!(matches.contains(&("cycle-reasoning-effort", "Variant Cycle")));
     }
 
     #[test]

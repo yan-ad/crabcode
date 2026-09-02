@@ -1545,24 +1545,20 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
                 return Some(Ok(responses_error_chunk(&value, event_type)));
             }
             let resp = &value["response"];
+            log_openai_responses_completed(resp);
             Some(Ok(ChunkType::ResponseCompleted {
                 end_turn: resp.get("end_turn").and_then(|value| value.as_bool()),
                 reasoning_items: reasoning_items_from_response_output(resp),
+                doom_loop_triggers: doom_loop_triggers_from(resp),
                 usage: resp.get("usage").and_then(openai_responses_usage),
             }))
         }
         // Grok Build / cli-chat-proxy: `response.doom_loop_check` with
         // `doom_loop_check.triggers` like `tail_repetition:8@thinking`.
-        // `.devrefs/references/xai-org/grok-build/crates/codegen/xai-grok-sampler/src/doom_loop.rs`
+        // Also present on `response.completed` (`doom_loop_check` field).
+        // `.devrefs/references/xai-org/grok-build/crates/codegen/xai-grok-sampling-types/src/doom_loop.rs`
         "response.doom_loop_check" => {
-            let triggers = value
-                .pointer("/doom_loop_check/triggers")
-                .and_then(|value| value.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+            let triggers = doom_loop_triggers_from(&value).join(",");
             Some(Ok(ChunkType::Metadata(format!(
                 "doom_loop_check triggers={triggers}"
             ))))
@@ -1632,6 +1628,42 @@ fn openai_responses_usage(usage: &serde_json::Value) -> Option<crate::chunk::Tok
         cache_read: cached,
         cache_write: 0,
     })
+}
+
+/// Attribute a `response.completed` payload when a turn ends without an error.
+fn log_openai_responses_completed(response: &serde_json::Value) {
+    let status = response
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let end_turn = response.get("end_turn").and_then(|value| value.as_bool());
+    let incomplete_reason = response
+        .pointer("/incomplete_details/reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    let output = response.get("output").and_then(|value| value.as_array());
+    let output_count = output.map_or(0, Vec::len);
+    let output_types = output
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("type").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let doom_loop = doom_loop_triggers_from(response).join(",");
+    crate::log::log(&format!(
+        "openai-responses completed status={status} end_turn={end_turn:?} incomplete_reason={incomplete_reason} output_count={output_count} output_types=[{output_types}] doom_loop_check={doom_loop}"
+    ));
+}
+
+fn doom_loop_triggers_from(value: &serde_json::Value) -> Vec<String> {
+    value
+        .pointer("/doom_loop_check/triggers")
+        .or_else(|| value.pointer("/response/doom_loop_check/triggers"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect()
 }
 
 fn responses_provider_error_message(value: &serde_json::Value, fallback: &str) -> String {
