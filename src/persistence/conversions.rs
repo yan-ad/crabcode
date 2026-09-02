@@ -18,6 +18,12 @@ impl From<SessionMessage> for Message {
                     data: serde_json::json!({ "text": msg.content }),
                 });
             }
+            for path in &msg.local_audio_paths {
+                parts.push(PersistenceMessagePart {
+                    part_type: "local_audio".to_string(),
+                    data: serde_json::json!({ "path": path }),
+                });
+            }
             parts
         } else {
             msg.parts
@@ -41,6 +47,12 @@ impl From<SessionMessage> for Message {
         for path in &msg.local_image_paths {
             parts.push(PersistenceMessagePart {
                 part_type: "local_image".to_string(),
+                data: serde_json::json!({ "path": path }),
+            });
+        }
+        for path in &msg.local_audio_paths {
+            parts.push(PersistenceMessagePart {
+                part_type: "local_audio".to_string(),
                 data: serde_json::json!({ "path": path }),
             });
         }
@@ -71,7 +83,7 @@ impl From<SessionMessage> for Message {
         }
 
         Message {
-            id: cuid2::create_id(),
+            id: msg.id,
             session_id: 0,
             role: match msg.role {
                 MessageRole::User => "user".to_string(),
@@ -94,6 +106,11 @@ impl From<SessionMessage> for Message {
             t1_ms: msg.t1_ms.map(|v| v as i64),
             tn_ms: msg.tn_ms.map(|v| v as i64),
             output_tokens: msg.output_tokens.map(|v| v as i64),
+            input_tokens: msg.input_tokens.map(|v| v as i64),
+            cache_read_tokens: msg.cache_read_tokens.map(|v| v as i64),
+            cache_write_tokens: msg.cache_write_tokens.map(|v| v as i64),
+            cost: msg.cost,
+            usage_authoritative: msg.usage_authoritative,
         }
     }
 }
@@ -109,6 +126,15 @@ impl TryFrom<Message> for SessionMessage {
                 part_type: part.part_type.clone(),
                 data: part.data.clone(),
             })
+            .collect();
+        let local_audio_paths = session_parts
+            .iter()
+            .filter_map(|part| {
+                (part.part_type == "local_audio")
+                    .then(|| part.data.get("path").and_then(|value| value.as_str()))
+                    .flatten()
+            })
+            .map(str::to_string)
             .collect();
 
         let content = session_parts
@@ -170,6 +196,7 @@ impl TryFrom<Message> for SessionMessage {
         };
 
         Ok(SessionMessage {
+            id: msg.id,
             role,
             content,
             reasoning,
@@ -200,10 +227,30 @@ impl TryFrom<Message> for SessionMessage {
             output_tokens: msg
                 .output_tokens
                 .and_then(|v| if v > 0 { Some(v as usize) } else { None }),
+            input_tokens: msg
+                .input_tokens
+                .and_then(|v| if v > 0 { Some(v as usize) } else { None }),
+            cache_read_tokens: msg.cache_read_tokens.and_then(|v| {
+                if v > 0 {
+                    Some(v as usize)
+                } else {
+                    None
+                }
+            }),
+            cache_write_tokens: msg.cache_write_tokens.and_then(|v| {
+                if v > 0 {
+                    Some(v as usize)
+                } else {
+                    None
+                }
+            }),
+            cost: msg.cost,
+            usage_authoritative: msg.usage_authoritative,
             tokens_per_sec: None,
             model: msg.model.clone(),
             provider: msg.provider.clone(),
             local_image_paths,
+            local_audio_paths,
             compaction_stats,
             was_interrupted,
         })
@@ -230,6 +277,49 @@ pub fn persistence_to_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_id_round_trips_through_persistence() {
+        let session_message = SessionMessage::assistant("hello");
+        let id = session_message.id.clone();
+
+        let persistence_message: Message = session_message.into();
+        assert_eq!(persistence_message.id, id);
+
+        let restored = SessionMessage::try_from(persistence_message).unwrap();
+        assert_eq!(restored.id, id);
+    }
+
+    #[test]
+    fn authoritative_usage_round_trips_through_persistence() {
+        let mut session_message = SessionMessage::assistant("hello");
+        session_message.apply_usage(
+            crate::aisdk::chunk::LanguageModelUsage {
+                input_tokens: 100,
+                output_tokens: 25,
+                cache_read_tokens: 60,
+                cache_write_tokens: 10,
+            },
+            Some(0.0125),
+        );
+
+        let restored = SessionMessage::try_from(Message::from(session_message)).unwrap();
+        assert_eq!(restored.input_tokens, Some(100));
+        assert_eq!(restored.output_tokens, Some(25));
+        assert_eq!(restored.cache_read_tokens, Some(60));
+        assert_eq!(restored.cache_write_tokens, Some(10));
+        assert_eq!(restored.cost, Some(0.0125));
+        assert!(restored.usage_authoritative);
+    }
+
+    #[test]
+    fn audio_paths_round_trip_through_persistence() {
+        let mut session_message = SessionMessage::user("listen");
+        session_message.local_audio_paths = vec!["/tmp/audio.wav".to_string()];
+
+        let restored = SessionMessage::try_from(Message::from(session_message)).unwrap();
+        assert_eq!(restored.local_audio_paths, vec!["/tmp/audio.wav"]);
+    }
 
     #[test]
     fn compaction_stats_round_trip_through_message_parts() {

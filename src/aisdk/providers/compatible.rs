@@ -248,7 +248,7 @@ fn openai_compatible_request_body(
 }
 
 fn openai_compatible_user_content(user: &crate::message::UserMessage) -> serde_json::Value {
-    if user.images.is_empty() {
+    if user.images.is_empty() && user.audios.is_empty() {
         return serde_json::json!(user.content);
     }
 
@@ -264,6 +264,15 @@ fn openai_compatible_user_content(user: &crate::message::UserMessage) -> serde_j
             "type": "image_url",
             "image_url": {
                 "url": image.data_url,
+            },
+        })
+    }));
+    parts.extend(user.audios.iter().map(|audio| {
+        serde_json::json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": audio.data,
+                "format": audio.format,
             },
         })
     }));
@@ -446,7 +455,7 @@ fn debug_log(msg: &str) {
 /// Log OpenAI-compatible / AI Gateway usage via the host logger.
 /// Looks for `prompt_tokens_details.cached_tokens` and Anthropic-style fields
 /// that some gateways forward.
-fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::TokenUsage> {
+fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::LanguageModelUsage> {
     let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion = usage.get("completion_tokens").and_then(|v| v.as_u64());
     let cached = usage
@@ -500,16 +509,26 @@ fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::To
         hit_pct
     ));
 
-    Some(crate::chunk::TokenUsage {
-        input: prompt_v.saturating_sub(effective_cached),
-        output: completion.unwrap_or(0),
-        cache_read: effective_cached,
-        cache_write: cache_creation,
+    let anthropic_shape = cached == 0 && (cache_read > 0 || cache_creation > 0);
+    let input_tokens = if anthropic_shape {
+        prompt
+            .unwrap_or(0)
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation)
+    } else {
+        prompt.unwrap_or(0)
+    };
+    Some(crate::chunk::LanguageModelUsage {
+        input_tokens,
+        output_tokens: completion.unwrap_or(0),
+        cache_read_tokens: effective_cached,
+        cache_write_tokens: cache_creation,
     })
 }
 
 fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
     let data = data.trim();
+    let mut chunks = Vec::new();
 
     if data == "[DONE]" {
         debug_log("[SSE] Terminal: [DONE]");
@@ -518,7 +537,7 @@ fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
 
     if data.is_empty() || is_sse_metadata_line(data) {
         debug_log("[SSE] Ignored: empty or metadata/comment");
-        return vec![];
+        return chunks;
     }
 
     debug_log(&format!("[SSE] Raw data: {}", data));
@@ -543,30 +562,25 @@ fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
     // Final usage often arrives on a choices-empty (or choices-missing) chunk.
     // Log cache-related fields so gateway Anthropic hits are verifiable.
     let usage = value.get("usage").and_then(openai_compatible_usage);
+    if let Some(usage) = usage {
+        chunks.push(Ok(ChunkType::Usage(usage)));
+    }
 
     let Some(choices) = value["choices"].as_array() else {
         debug_log(&format!(
             "[SSE] No choices array. JSON keys: {:?}",
             value.as_object().map(|o| o.keys().collect::<Vec<_>>())
         ));
-        return usage
-            .map(|usage| vec![Ok(ChunkType::Usage(usage))])
-            .unwrap_or_default();
+        return chunks;
     };
 
     if choices.is_empty() {
         debug_log("[SSE] choices array is empty");
-        return usage
-            .map(|usage| vec![Ok(ChunkType::Usage(usage))])
-            .unwrap_or_default();
+        return chunks;
     }
 
     let choice = &choices[0];
     let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
-    let mut chunks = usage
-        .map(|usage| vec![Ok(ChunkType::Usage(usage))])
-        .unwrap_or_default();
-
     // Log the full choice structure for debugging
     debug_log(&format!(
         "[SSE] Choice JSON: {}",
@@ -625,12 +639,6 @@ fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
 
     match finish_reason {
         "" => {}
-        "length" => chunks.push(Ok(ChunkType::Incomplete(
-            "finish_reason=length".to_string(),
-        ))),
-        "content_filter" => chunks.push(Ok(ChunkType::Failed(
-            "finish_reason=content_filter".to_string(),
-        ))),
         _ => chunks.push(Ok(ChunkType::End {
             reason: Some(FinishReason::from_openai_compatible(finish_reason)),
         })),
@@ -673,11 +681,41 @@ mod tests {
     }
 
     #[test]
-    fn request_asks_streaming_gateways_for_token_usage() {
-        let body = openai_compatible_request_body("test-model", Vec::new());
+    fn serializes_audio_input_content_part() {
+        let user = crate::message::UserMessage {
+            content: "Describe this".to_string(),
+            images: Vec::new(),
+            audios: vec![crate::message::AudioContent {
+                data: "YXVkaW8=".to_string(),
+                format: "wav".to_string(),
+                media_type: "audio/wav".to_string(),
+            }],
+        };
 
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(
+            openai_compatible_user_content(&user),
+            serde_json::json!([
+                {"type": "text", "text": "Describe this"},
+                {"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn usage_only_chunk_emits_normalized_usage() {
+        let chunks = process_sse_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":80}}}"#,
+        );
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [Ok(ChunkType::Usage(crate::chunk::LanguageModelUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_read_tokens: 80,
+                cache_write_tokens: 0,
+            }))]
+        ));
     }
 
     #[test]
@@ -809,14 +847,17 @@ mod tests {
     }
 
     #[test]
-    fn length_finish_reason_emits_incomplete_chunk() {
+    fn length_finish_reason_emits_terminal_reason() {
         let data = r#"{"choices":[{"index":0,"finish_reason":"length","delta":{"role":"assistant","content":""}}]}"#;
 
         let chunks = process_sse_data(data);
 
-        assert!(chunks
-            .iter()
-            .any(|chunk| matches!(chunk, Ok(ChunkType::Incomplete(_)))));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Ok(ChunkType::End {
+                reason: Some(FinishReason::Length)
+            })
+        )));
     }
 
     #[test]

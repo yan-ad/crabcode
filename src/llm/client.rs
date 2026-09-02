@@ -5,10 +5,10 @@ use crate::aisdk::core::{
     stop::StopReason,
     Message as AisdkMessage, Tool,
 };
-use crate::aisdk::message::ImageContent;
+use crate::aisdk::message::{AudioContent, ImageContent};
 use crate::aisdk::{Anthropic, OpenAI, OpenAICompatible};
 use futures::StreamExt;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, path::Path, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::aisdk_bridge::convert_to_aisdk_tools;
@@ -43,9 +43,58 @@ struct ProviderRequestConfig {
     api_key: Option<String>,
     reasoning_effort: Option<crate::model::reasoning::ReasoningEffort>,
     supports_image_input: bool,
+    supports_audio_input: bool,
+    pricing: Option<crate::model::discovery::Cost>,
     openai_options: OpenAIRequestOptions,
     /// Vercel AI Gateway: enable `providerOptions.gateway.caching = "auto"`.
     gateway_caching_auto: bool,
+}
+
+fn provider_kind_for_model(
+    provider_name: &str,
+    npm_package: &str,
+    supports_audio_input: bool,
+) -> ProviderKind {
+    let kind = ProviderKind::from_provider(provider_name, npm_package);
+    if supports_audio_input && kind == ProviderKind::OpenAI {
+        ProviderKind::OpenAICompatible
+    } else {
+        kind
+    }
+}
+
+fn model_supports_audio_input(model: Option<&crate::model::discovery::Model>) -> bool {
+    model
+        .and_then(|model| model.modalities.as_ref())
+        .is_some_and(|modalities| modalities.input.iter().any(|item| item == "audio"))
+}
+
+fn usage_cost(
+    usage: crate::aisdk::chunk::LanguageModelUsage,
+    pricing: Option<&crate::model::discovery::Cost>,
+) -> Option<f64> {
+    let pricing = pricing?;
+    let cached = usage.cache_read_tokens.min(usage.input_tokens);
+    let written = usage
+        .cache_write_tokens
+        .min(usage.input_tokens.saturating_sub(cached));
+    let uncached = usage
+        .input_tokens
+        .saturating_sub(cached)
+        .saturating_sub(written);
+    let input_cost = uncached as f64 * pricing.input;
+    let cache_read_cost = cached as f64 * pricing.cache_read.unwrap_or(pricing.input);
+    let cache_write_cost = written as f64 * pricing.cache_write.unwrap_or(pricing.input);
+    let output_cost = usage.output_tokens as f64 * pricing.output;
+    Some((input_cost + cache_read_cost + cache_write_cost + output_cost) / 1_000_000.0)
+}
+
+fn turn_stop_reason(stop_reason: Option<&StopReason>) -> Option<crate::llm::TurnStopReason> {
+    match stop_reason {
+        Some(StopReason::MaxTokens) => Some(crate::llm::TurnStopReason::MaxTokens),
+        Some(StopReason::Refusal) => Some(crate::llm::TurnStopReason::Refusal),
+        _ => None,
+    }
 }
 
 impl ProviderRequestConfig {
@@ -66,6 +115,8 @@ impl ProviderRequestConfig {
             api_key,
             reasoning_effort,
             supports_image_input,
+            supports_audio_input: false,
+            pricing: None,
             openai_options: OpenAIRequestOptions::default(),
             gateway_caching_auto: false,
         }
@@ -569,6 +620,7 @@ fn truncate_log_value(value: &str, max_chars: usize) -> String {
 struct StreamRelayResult {
     outcome: StreamRelayOutcome,
     stats: RelayStats,
+    usage: Option<crate::aisdk::chunk::LanguageModelUsage>,
 }
 
 pub async fn stream_llm_with_cancellation(
@@ -672,9 +724,10 @@ pub async fn stream_llm_with_cancellation(
         );
     }
 
-    let aisdk_messages = convert_messages_for_model(
+    let aisdk_messages = convert_messages_for_model_with_audio(
         &messages,
         request_config.supports_image_input,
+        request_config.supports_audio_input,
         show_vlm_agent_hint,
     );
     // Stamp Build affinity *after* message conversion so turn_idx matches wire content.
@@ -737,6 +790,7 @@ pub async fn stream_llm_with_cancellation(
 
     let start_time = Instant::now();
     let mut token_count: usize = 0;
+    let pricing = request_config.pricing.clone();
 
     let relay_result = match relay_stream_to_sender(
         &mut response.stream,
@@ -746,6 +800,8 @@ pub async fn stream_llm_with_cancellation(
         &start_time,
         primary_log_context,
         model_mismatch_warning,
+        pricing.as_ref(),
+        None,
     )
     .await
     .map_err(|err| err.to_string())
@@ -767,6 +823,9 @@ pub async fn stream_llm_with_cancellation(
     };
 
     let stop_reason = response.stop_reason().await;
+    if let Some(reason) = turn_stop_reason(stop_reason.as_ref()) {
+        let _ = sender.send(crate::llm::ChunkMessage::TurnStopReason(reason));
+    }
     let stream_outcome = relay_result.outcome;
     let primary_outcome_label = stream_outcome_label(stream_outcome, stop_reason.as_ref());
     crate::emit_log!(
@@ -835,6 +894,8 @@ pub async fn stream_llm_with_cancellation(
         &start_time,
         summary_log_context,
         None,
+        pricing.as_ref(),
+        relay_result.usage,
     )
     .await
     .map_err(|err| err.to_string())
@@ -1095,8 +1156,13 @@ async fn prepare_request_config(
     };
 
     let supports_image_input = model_supports_image_input(&model, provider.models.get(&model));
+    let supports_audio_input = model_supports_audio_input(provider.models.get(&model));
     let model_route = resolve_model_route(&provider, model);
-    let provider_kind = ProviderKind::from_provider(provider_name, &model_route.npm_package);
+    let provider_kind = provider_kind_for_model(
+        provider_name,
+        &model_route.npm_package,
+        supports_audio_input,
+    );
     let base_url = if provider_name == "xai" && model_route.api.trim().is_empty() {
         // models.dev currently ships empty api for xAI; default to the public endpoint.
         "https://api.x.ai".to_string()
@@ -1118,6 +1184,11 @@ async fn prepare_request_config(
         reasoning_effort,
         supports_image_input,
     );
+    request_config.pricing = provider
+        .models
+        .get(&model_route.model_name)
+        .and_then(|model| model.cost.clone());
+    request_config.supports_audio_input = supports_audio_input;
     // Anthropic via AI Gateway needs explicit cache markers; gateway "auto"
     // inserts them. Without this, Anthropic traffic never cache-reads.
     if is_vercel_ai_gateway(provider_name, &model_route.npm_package) {
@@ -1847,8 +1918,11 @@ async fn relay_stream_to_sender(
     start_time: &Instant,
     context: StreamLogContext<'_>,
     mut mismatch_warning: Option<String>,
+    pricing: Option<&crate::model::discovery::Cost>,
+    base_usage: Option<crate::aisdk::chunk::LanguageModelUsage>,
 ) -> Result<StreamRelayResult, DynError> {
     let mut stats = RelayStats::default();
+    let mut stream_usage = None;
     crate::emit_log!(
         "[RELAY] relay_stream_to_sender started {}",
         context.describe()
@@ -1951,11 +2025,15 @@ async fn relay_stream_to_sender(
                 let _ = sender.send(crate::llm::ChunkMessage::Metrics {
                     token_count: *token_count,
                     duration_ms,
+                    usage: combined_usage(base_usage, stream_usage),
+                    cost: combined_usage(base_usage, stream_usage)
+                        .and_then(|usage| usage_cost(usage, pricing)),
                 });
                 let _ = sender.send(crate::llm::ChunkMessage::End);
                 return Ok(StreamRelayResult {
                     outcome: StreamRelayOutcome::Ended,
                     stats,
+                    usage: combined_usage(base_usage, stream_usage),
                 });
             }
             ChunkType::ResponseCompleted { end_turn, .. } => {
@@ -1970,11 +2048,15 @@ async fn relay_stream_to_sender(
                 let _ = sender.send(crate::llm::ChunkMessage::Metrics {
                     token_count: *token_count,
                     duration_ms,
+                    usage: combined_usage(base_usage, stream_usage),
+                    cost: combined_usage(base_usage, stream_usage)
+                        .and_then(|usage| usage_cost(usage, pricing)),
                 });
                 let _ = sender.send(crate::llm::ChunkMessage::End);
                 return Ok(StreamRelayResult {
                     outcome: StreamRelayOutcome::Ended,
                     stats,
+                    usage: combined_usage(base_usage, stream_usage),
                 });
             }
             ChunkType::AssistantMessagePhase { phase } => {
@@ -1990,9 +2072,14 @@ async fn relay_stream_to_sender(
                 crate::emit_log!("[RELAY] Metadata {}", message);
             }
             ChunkType::Usage(usage) => {
-                let elapsed_ms = start_time.elapsed().as_millis();
-                stats.record_chunk("Usage", elapsed_ms);
-                let _ = sender.send(crate::llm::ChunkMessage::Usage(usage));
+                stream_usage = Some(usage);
+                crate::emit_log!(
+                    "[RELAY] Usage input={} output={} cache_read={} cache_write={}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                );
             }
             ChunkType::Retry(status) => {
                 let elapsed_ms = start_time.elapsed().as_millis();
@@ -2087,7 +2174,22 @@ async fn relay_stream_to_sender(
     Ok(StreamRelayResult {
         outcome: StreamRelayOutcome::Exhausted,
         stats,
+        usage: combined_usage(base_usage, stream_usage),
     })
+}
+
+fn combined_usage(
+    base: Option<crate::aisdk::chunk::LanguageModelUsage>,
+    current: Option<crate::aisdk::chunk::LanguageModelUsage>,
+) -> Option<crate::aisdk::chunk::LanguageModelUsage> {
+    match (base, current) {
+        (None, None) => None,
+        (Some(usage), None) | (None, Some(usage)) => Some(usage),
+        (Some(mut base), Some(current)) => {
+            base += current;
+            Some(base)
+        }
+    }
 }
 
 async fn reached_step_limit(agent_max_steps: Option<usize>, response: &StreamTextResponse) -> bool {
@@ -2098,6 +2200,33 @@ fn estimate_tokens(content: &str) -> usize {
     content.chars().count().max(1) / 4
 }
 
+fn audio_content_for_path(path: &Path) -> Option<AudioContent> {
+    use base64::Engine as _;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    let media_type = match extension.as_str() {
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        _ => {
+            crate::emit_log!("unsupported audio attachment format: {}", path.display());
+            return None;
+        }
+    };
+    match std::fs::read(path) {
+        Ok(data) => Some(AudioContent {
+            data: base64::engine::general_purpose::STANDARD.encode(data),
+            format: extension,
+            media_type: media_type.to_string(),
+        }),
+        Err(error) => {
+            crate::emit_log!("failed to attach audio {}: {}", path.display(), error);
+            None
+        }
+    }
+}
+
 fn convert_messages(messages: &[crate::session::types::Message]) -> Vec<AisdkMessage> {
     convert_messages_for_model(messages, true, false)
 }
@@ -2105,6 +2234,20 @@ fn convert_messages(messages: &[crate::session::types::Message]) -> Vec<AisdkMes
 fn convert_messages_for_model(
     messages: &[crate::session::types::Message],
     supports_image_input: bool,
+    show_vlm_agent_hint: bool,
+) -> Vec<AisdkMessage> {
+    convert_messages_for_model_with_audio(
+        messages,
+        supports_image_input,
+        false,
+        show_vlm_agent_hint,
+    )
+}
+
+fn convert_messages_for_model_with_audio(
+    messages: &[crate::session::types::Message],
+    supports_image_input: bool,
+    supports_audio_input: bool,
     show_vlm_agent_hint: bool,
 ) -> Vec<AisdkMessage> {
     let mut aisdk_messages = Vec::new();
@@ -2128,22 +2271,17 @@ fn convert_messages_for_model(
                 aisdk_messages.push(AisdkMessage::system(content));
             }
             crate::session::types::MessageRole::User => {
-                let content = crate::utils::sanitize::strip_legacy_image_descriptions(&msg.content);
+                let mut content =
+                    crate::utils::sanitize::strip_legacy_image_descriptions(&msg.content);
                 if !supports_image_input && !msg.local_image_paths.is_empty() {
                     if show_vlm_agent_hint {
-                        aisdk_messages.push(AisdkMessage::user(content_with_vlm_agent_hint(
-                            &content,
-                            &msg.local_image_paths,
-                        )));
+                        content = content_with_vlm_agent_hint(&content, &msg.local_image_paths);
                     } else {
-                        aisdk_messages.push(AisdkMessage::user(
-                            content_with_unsupported_image_note(
-                                &content,
-                                msg.local_image_paths.len(),
-                            ),
-                        ));
+                        content = content_with_unsupported_image_note(
+                            &content,
+                            msg.local_image_paths.len(),
+                        );
                     }
-                    continue;
                 }
 
                 let images = msg
@@ -2168,18 +2306,36 @@ fn convert_messages_for_model(
                     })
                     .collect::<Vec<_>>();
 
-                // Empty user rows without images also pad the sticky prefix.
-                if content.trim().is_empty() && images.is_empty() {
+                let audios = if supports_audio_input {
+                    msg.local_audio_paths
+                        .iter()
+                        .filter_map(|path| audio_content_for_path(Path::new(path)))
+                        .collect::<Vec<_>>()
+                } else {
+                    if !msg.local_audio_paths.is_empty() {
+                        content.push_str(&format!(
+                            "\n\n[{} audio attachment(s) omitted because the selected model does not support audio input.]",
+                            msg.local_audio_paths.len()
+                        ));
+                    }
+                    Vec::new()
+                };
+
+                // Empty user rows without attachments also pad the sticky prefix.
+                if content.trim().is_empty() && images.is_empty() && audios.is_empty() {
                     continue;
                 }
 
-                if images.is_empty() {
+                if images.is_empty() && audios.is_empty() {
                     aisdk_messages.push(AisdkMessage::user(content));
                 } else {
-                    aisdk_messages.push(AisdkMessage::user_with_images(
-                        content_with_vision_attached_image_hint(&content),
-                        images,
-                    ));
+                    let content = if images.is_empty() {
+                        content
+                    } else {
+                        content_with_vision_attached_image_hint(&content)
+                    };
+                    aisdk_messages
+                        .push(AisdkMessage::user_with_attachments(content, images, audios));
                 }
             }
             crate::session::types::MessageRole::Assistant => {
@@ -2612,14 +2768,50 @@ fn normalize_anthropic_base_url(base_url: &str) -> String {
 mod tests {
     use super::{
         apply_provider_request_defaults, convert_messages, convert_messages_for_model,
-        is_openai_oauth_model_allowed, maybe_apply_unauthenticated_free_provider_key,
-        model_supports_image_input, openai_oauth_default_originator,
-        openai_oauth_model_uses_responses_lite, openai_request_instructions, resolve_api_key,
-        resolve_model_route, ui_vs_request_model_mismatch_warning, vlm_agent_has_model,
-        AisdkMessage, OpenAIRequestOptions, ProviderKind, ProviderRequestConfig,
+        convert_messages_for_model_with_audio, is_openai_oauth_model_allowed,
+        maybe_apply_unauthenticated_free_provider_key, model_supports_image_input,
+        openai_oauth_default_originator, openai_oauth_model_uses_responses_lite,
+        openai_request_instructions, provider_kind_for_model, resolve_api_key, resolve_model_route,
+        ui_vs_request_model_mismatch_warning, vlm_agent_has_model, AisdkMessage,
+        OpenAIRequestOptions, ProviderKind, ProviderRequestConfig,
     };
 
     use crate::persistence::AuthConfig;
+    use base64::Engine as _;
+
+    #[test]
+    fn audio_model_receives_base64_audio_attachment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sample.wav");
+        std::fs::write(&path, b"audio-bytes").unwrap();
+        let mut user_message = crate::session::types::Message::user("transcribe");
+        user_message.local_audio_paths = vec![path.to_string_lossy().into_owned()];
+
+        let messages = convert_messages_for_model_with_audio(&[user_message], false, true, false);
+        let AisdkMessage::User(message) = &messages[0] else {
+            panic!("expected user message");
+        };
+        assert_eq!(message.audios.len(), 1);
+        assert_eq!(message.audios[0].format, "wav");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&message.audios[0].data)
+                .unwrap(),
+            b"audio-bytes"
+        );
+    }
+
+    #[test]
+    fn openai_audio_models_use_chat_completions_transport() {
+        assert_eq!(
+            provider_kind_for_model("openai", "@ai-sdk/openai", true),
+            ProviderKind::OpenAICompatible
+        );
+        assert_eq!(
+            provider_kind_for_model("openai", "@ai-sdk/openai", false),
+            ProviderKind::OpenAI
+        );
+    }
 
     #[test]
     fn stored_auth_takes_precedence_over_custom_provider_api_key() {
@@ -3778,4 +3970,35 @@ fn content_with_vlm_agent_hint(content: &str, image_paths: &[String]) -> String 
     } else {
         format!("{content}\n\n{hint}")
     }
+}
+#[test]
+fn maps_runtime_stop_reasons_to_turn_events() {
+    assert_eq!(
+        turn_stop_reason(Some(&StopReason::MaxTokens)),
+        Some(crate::llm::TurnStopReason::MaxTokens)
+    );
+    assert_eq!(
+        turn_stop_reason(Some(&StopReason::Refusal)),
+        Some(crate::llm::TurnStopReason::Refusal)
+    );
+    assert_eq!(turn_stop_reason(Some(&StopReason::Finish)), None);
+}
+
+#[test]
+fn computes_cache_aware_usage_cost() {
+    let usage = crate::aisdk::chunk::LanguageModelUsage {
+        input_tokens: 1_000_000,
+        output_tokens: 100_000,
+        cache_read_tokens: 600_000,
+        cache_write_tokens: 100_000,
+    };
+    let pricing = crate::model::discovery::Cost {
+        input: 2.0,
+        output: 10.0,
+        cache_read: Some(0.2),
+        cache_write: Some(2.5),
+    };
+
+    let cost = usage_cost(usage, Some(&pricing)).unwrap();
+    assert!((cost - 1.97).abs() < f64::EPSILON);
 }

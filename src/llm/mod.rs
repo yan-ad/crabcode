@@ -17,7 +17,7 @@ pub enum ChunkMessage {
         reasoning: String,
     },
     Warning(String),
-    Usage(crate::aisdk::chunk::TokenUsage),
+    Usage(crate::aisdk::chunk::LanguageModelUsage),
     ToolCalls(Vec<ToolCall>),
     ToolResult(ToolCallResult),
     SubagentStarted {
@@ -36,6 +36,7 @@ pub enum ChunkMessage {
     },
     PermissionRequest(crate::tools::PermissionPrompt),
     QuestionRequest {
+        tool_call_id: Option<String>,
         questions: serde_json::Value,
         response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
     },
@@ -48,13 +49,22 @@ pub enum ChunkMessage {
         job_id: String,
         event: BackgroundJobEventKind,
     },
+    TurnStopReason(TurnStopReason),
     End,
     Failed(String),
     Cancelled,
     Metrics {
         token_count: usize,
         duration_ms: u64,
+        usage: Option<crate::aisdk::chunk::LanguageModelUsage>,
+        cost: Option<f64>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStopReason {
+    MaxTokens,
+    Refusal,
 }
 
 #[derive(Debug, Clone)]

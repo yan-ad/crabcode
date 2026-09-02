@@ -20,7 +20,7 @@ pub enum ChunkType {
         end_turn: Option<bool>,
         reasoning_items: Vec<ReasoningReplayItem>,
         doom_loop_triggers: Vec<String>,
-        usage: Option<TokenUsage>,
+        usage: Option<LanguageModelUsage>,
     },
     Retry(crate::retry::RetryStatus),
     StreamRollback {
@@ -29,7 +29,8 @@ pub enum ChunkType {
     },
     Warning(String),
     Metadata(String),
-    Usage(TokenUsage),
+    /// Provider-reported token usage for one model request.
+    Usage(LanguageModelUsage),
     End {
         reason: Option<FinishReason>,
     },
@@ -39,18 +40,33 @@ pub enum ChunkType {
     NotSupported(String),
 }
 
+/// Normalized provider usage. `input_tokens` includes cached input; cache
+/// fields describe subsets used for pricing and observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TokenUsage {
-    /// Non-cached input tokens.
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+pub struct LanguageModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
-impl TokenUsage {
+impl LanguageModelUsage {
     pub fn is_empty(self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+    }
+}
+
+impl std::ops::AddAssign for LanguageModelUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(rhs.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(rhs.cache_write_tokens);
     }
 }
 
