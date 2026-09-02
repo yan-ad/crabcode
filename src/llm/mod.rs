@@ -64,6 +64,7 @@ pub enum ChunkMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStopReason {
     MaxTokens,
+    MaxTurnRequests,
     Refusal,
 }
 
