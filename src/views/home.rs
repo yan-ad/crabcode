@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::theme::ThemeColors;
 use crate::ui::components::input::Input;
 use crate::ui::components::status_bar::StatusBar;
+use crate::views::chat::{btw_panel_height, chat_input_height, render_btw_panel};
 
 const LOGO: &str = include_str!("../../crabcode-logo.txt");
 const MASCOT: &str = include_str!("../../mascot.txt");
@@ -86,9 +87,14 @@ pub fn render_home(
     model: String,
     provider_name: String,
     reasoning_effort: Option<String>,
+    reasoning_effort_explicit: bool,
     mcp_summary: McpSummary,
     colors: &ThemeColors,
     usage_text: &str,
+    btw_entry: Option<&crate::app::BtwEntry>,
+    btw_scroll: usize,
+    btw_panel_area: &mut Option<ratatui::layout::Rect>,
+    show_terminal_cursor: bool,
 ) {
     let size = f.area();
 
@@ -97,12 +103,14 @@ pub fn render_home(
         .constraints([Constraint::Min(0), Constraint::Length(1)].as_ref())
         .split(size);
 
-    let input_height = input.get_height_for_width(size.width);
+    let btw_height = btw_panel_height(btw_entry, size.width, colors);
+    let input_height = chat_input_height(input, size.width, size.height, 0, btw_height, 1);
     let home_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             [
                 Constraint::Min(0),
+                Constraint::Length(btw_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -231,13 +239,22 @@ pub fn render_home(
     }
     input.render(
         f,
-        home_chunks[1],
+        home_chunks[2],
         &agent,
         &model,
         &provider_name,
         reasoning_effort.as_deref(),
+        reasoning_effort_explicit,
         colors,
-        true,
+        show_terminal_cursor,
+    );
+    render_btw_panel(
+        f,
+        home_chunks[1],
+        btw_entry,
+        btw_scroll,
+        btw_panel_area,
+        colors,
     );
 
     let help_text = vec![
@@ -248,7 +265,7 @@ pub fn render_home(
     ];
     let help_line = Line::from(help_text);
     let help_width = help_line.width() as u16;
-    let available_width = home_chunks[2].width;
+    let available_width = home_chunks[3].width;
     let help_width = help_width.min(available_width);
 
     let mut status_spans = Vec::new();
@@ -284,7 +301,7 @@ pub fn render_home(
             Constraint::Min(0),
             Constraint::Length(help_width),
         ])
-        .split(home_chunks[2]);
+        .split(home_chunks[3]);
 
     if status_width > 0 {
         f.render_widget(Paragraph::new(status_line), status_chunks[0]);
@@ -296,7 +313,7 @@ pub fn render_home(
     // Keep spacer on theme canvas (don't Reset over solid bg).
     f.render_widget(
         Block::default().style(Style::default().bg(colors.background)),
-        home_chunks[3],
+        home_chunks[4],
     );
 
     let status_bar = StatusBar::new(version, cwd, branch, agent, model);

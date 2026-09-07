@@ -148,7 +148,6 @@ pub async fn stream_with_tools<P: Provider>(
         let mut cached_repeatable_tool_results: HashMap<String, ToolOutput> = HashMap::new();
         let mut phase_less_ambiguous_follow_ups = 0usize;
         let mut doom_loop = DoomLoopTracker::default();
-        let mut total_usage = crate::chunk::LanguageModelUsage::default();
 
         loop {
             step_idx += 1;
@@ -177,7 +176,8 @@ pub async fn stream_with_tools<P: Provider>(
             }
 
             let step_summary = provider_step_log_summary(&current_messages, &tools);
-            let pruned = maybe_prune_stale_tool_outputs(&mut current_messages);
+            let pruned =
+                maybe_prune_stale_tool_outputs(&mut current_messages, tool_prefix_tokens(&tools));
             if pruned > 0 {
                 let _ = tx_loop.send(ChunkType::Metadata(format!(
                     "tool_outputs_pruned count={} keep_user_turns={} hard_clear_age={}",
@@ -278,10 +278,6 @@ pub async fn stream_with_tools<P: Provider>(
                             doom_loop_triggers,
                             usage,
                         }) => {
-                            if let Some(usage) = usage {
-                                total_usage += usage;
-                                let _ = tx_loop.send(ChunkType::Usage(total_usage));
-                            }
                             saw_terminal_event = true;
                             response_end_turn = end_turn;
                             if let Some(usage) = usage {
@@ -367,8 +363,7 @@ pub async fn stream_with_tools<P: Provider>(
                             let _ = tx_loop.send(ChunkType::Metadata(msg));
                         }
                         Ok(ChunkType::Usage(usage)) => {
-                            total_usage += usage;
-                            let _ = tx_loop.send(ChunkType::Usage(total_usage));
+                            let _ = tx_loop.send(ChunkType::Usage(usage));
                         }
                         Ok(ChunkType::Warning(msg)) => {
                             let _ = tx_loop.send(ChunkType::Warning(msg));
@@ -1138,11 +1133,28 @@ fn estimated_input_tokens(messages: &[Message]) -> usize {
     (message_log_summary(messages).text_bytes + total_image_bytes(messages)) / 4
 }
 
+fn tool_prefix_tokens(tools: &[Tool]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            let schema_len = serde_json::to_vec(&tool.input_schema)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            tool.name.len() + tool.description.len() + schema_len
+        })
+        .sum::<usize>()
+        / 4
+}
+
 /// No-op until the transcript is large enough that Grok Build would prune
 /// (`total_tokens > context_window / 2`). Hard probing is almost always
 /// the model rereading because we already cleared the bytes it needed.
-fn maybe_prune_stale_tool_outputs(messages: &mut [Message]) -> usize {
-    if estimated_input_tokens(messages) <= PRUNE_AFTER_ESTIMATED_TOKENS {
+/// `extra_prefix_tokens` is the tools array (built-in + MCP schemas) that
+/// rides every request but is not in `messages`.
+fn maybe_prune_stale_tool_outputs(messages: &mut [Message], extra_prefix_tokens: usize) -> usize {
+    if estimated_input_tokens(messages).saturating_add(extra_prefix_tokens)
+        <= PRUNE_AFTER_ESTIMATED_TOKENS
+    {
         return 0;
     }
     prune_stale_tool_outputs_in_place(messages)
@@ -2104,11 +2116,32 @@ mod tests {
                 false,
             ));
         }
-        assert_eq!(maybe_prune_stale_tool_outputs(&mut messages), 0);
+        assert_eq!(maybe_prune_stale_tool_outputs(&mut messages, 0), 0);
         assert_ne!(
             tool_output_text(&messages, "c0"),
             PRUNED_TOOL_OUTPUT_PLACEHOLDER
         );
+    }
+
+    #[test]
+    fn maybe_prune_counts_tool_prefix_tokens() {
+        let mut messages = Vec::new();
+        for i in 0..=HARD_CLEAR_AGE_TURNS {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::tool_output(
+                format!("c{i}"),
+                "bash",
+                "x".repeat(TOOL_OUTPUT_SOFT_TRIM_CHARS + 50),
+                false,
+            ));
+        }
+        assert_eq!(maybe_prune_stale_tool_outputs(&mut messages, 0), 0);
+        let original_len = tool_output_text(&messages, "c0").len();
+        assert!(
+            maybe_prune_stale_tool_outputs(&mut messages, super::PRUNE_AFTER_ESTIMATED_TOKENS + 1)
+                > 0
+        );
+        assert!(tool_output_text(&messages, "c0").len() < original_len);
     }
 
     #[test]

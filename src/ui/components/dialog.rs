@@ -25,6 +25,35 @@ const SEARCH_AREA_HEIGHT: u16 = 2;
 const PROVIDER_EXACT_MATCH_BOOST: u32 = 1_000_000;
 const PROVIDER_PREFIX_MATCH_BOOST: u32 = 900_000;
 
+/// Dim everything outside `dialog_area` to mimic a semi-transparent
+/// backdrop (cf. opencode `RGBA(0,0,0,150)`, ~59% toward black).
+/// Terminals have no alpha channel, so each cell's `Rgb` background
+/// (~40% kept) and foreground (~50% kept) are scaled toward black and
+/// `DIM` is set. `Reset` channels are left alone so transparent mode
+/// keeps showing the terminal through.
+pub fn dim_backdrop(frame: &mut Frame, area: Rect, dialog_area: Rect) {
+    use ratatui::layout::Position;
+    fn scale(v: u8, num: u16, den: u16) -> u8 {
+        ((v as u16 * num) / den).min(255) as u8
+    }
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if dialog_area.contains(Position::new(x, y)) {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if let Color::Rgb(r, g, b) = cell.bg {
+                    cell.bg = Color::Rgb(scale(r, 2, 5), scale(g, 2, 5), scale(b, 2, 5));
+                }
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    cell.fg = Color::Rgb(scale(r, 1, 2), scale(g, 1, 2), scale(b, 1, 2));
+                }
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterSelectionMode {
     Preserve,
@@ -1154,7 +1183,10 @@ impl Dialog {
                     Span::styled(name, Style::default().fg(colors.primary)),
                 ]
             } else {
-                vec![Span::raw(format!("{indicator}{name}"))]
+                vec![Span::styled(
+                    format!("{indicator}{name}"),
+                    Style::default().fg(colors.text),
+                )]
             };
             return (spans, text_width);
         }
@@ -1170,7 +1202,10 @@ impl Dialog {
                     Span::styled(name, Style::default().fg(colors.primary)),
                 ]
             } else {
-                vec![Span::raw(format!("{indicator}{name}"))]
+                vec![Span::styled(
+                    format!("{indicator}{name}"),
+                    Style::default().fg(colors.text),
+                )]
             };
             return (spans, text_width);
         }
@@ -1188,7 +1223,10 @@ impl Dialog {
                 Style::default().fg(colors.primary),
             ));
         } else {
-            spans.push(Span::raw(format!("{indicator}{name_prefix}")));
+            spans.push(Span::styled(
+                format!("{indicator}{name_prefix}"),
+                Style::default().fg(colors.text),
+            ));
         }
         spans.push(Span::styled(
             description,
@@ -1645,6 +1683,7 @@ impl Dialog {
             }
         }
 
+        dim_backdrop(frame, area, self.dialog_area);
         frame.render_widget(Clear, self.dialog_area);
 
         self.content_area = self.padded_content_area();
@@ -1689,6 +1728,23 @@ impl Dialog {
         frame.render_widget(esc_paragraph, header_chunks[1]);
 
         if self.search_visible {
+            self.search_textarea.set_style(
+                Style::default()
+                    .fg(colors.text)
+                    .bg(colors.dialog_background),
+            );
+            self.search_textarea
+                .set_placeholder_style(Style::default().fg(colors.text_weak));
+            // Single caret: hardware cursor (place_terminal_cursor) is the
+            // source of truth. Fake block suppressed so complex emoji
+            // (ZWJ, VS16, flags) can't show as two split carets.
+            self.search_textarea.set_cursor_style(
+                Style::default()
+                    .fg(colors.text)
+                    .bg(colors.dialog_background),
+            );
+            self.search_textarea
+                .set_selection_style(Style::default().fg(colors.text).bg(colors.border_focus));
             frame.render_widget(&self.search_textarea, chunks[2]);
         }
 
@@ -1833,6 +1889,40 @@ impl Dialog {
         let footer_paragraph = Paragraph::new(self.footer_lines(chunks[5].width, colors))
             .alignment(ratatui::layout::Alignment::Left);
         frame.render_widget(footer_paragraph, chunks[5]);
+
+        self.place_terminal_cursor(frame, &chunks, &list_content_area);
+    }
+
+    /// Move the hardware terminal cursor into the dialog so terminal-level
+    /// cursor effects (e.g. ghostty cursor shaders) follow dialog focus
+    /// instead of staying stuck on the chat input behind the dialog.
+    ///
+    /// Typing always goes to the search box, so the cursor lives there —
+    /// even with an empty query. Dialogs without a search box (e.g.
+    /// /variants) set no cursor, letting ratatui hide it instead of
+    /// jumpily tracking list selection.
+    fn place_terminal_cursor(&self, frame: &mut Frame, chunks: &[Rect], _list_content_area: &Rect) {
+        if chunks.len() < 4 {
+            return;
+        }
+        if self.search_visible {
+            let search_area = chunks[2];
+            if search_area.width == 0 || search_area.height == 0 {
+                return;
+            }
+            let (cursor_row, cursor_col) = self.search_textarea.cursor();
+            let cursor_col = cursor_col.min(usize::MAX >> 1);
+            let line = self
+                .search_textarea
+                .lines()
+                .get(cursor_row)
+                .cloned()
+                .unwrap_or_default();
+            let prefix: String = line.chars().take(cursor_col).collect();
+            let x_offset = (prefix.width() as u16).min(search_area.width.saturating_sub(1));
+            let y_offset = (cursor_row as u16).min(search_area.height.saturating_sub(1));
+            frame.set_cursor_position((search_area.x + x_offset, search_area.y + y_offset));
+        }
     }
 
     pub fn footer_lines(&self, width: u16, colors: ThemeColors) -> Vec<Line<'static>> {

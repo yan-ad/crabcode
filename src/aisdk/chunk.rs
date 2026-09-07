@@ -20,7 +20,7 @@ pub enum ChunkType {
         end_turn: Option<bool>,
         reasoning_items: Vec<ReasoningReplayItem>,
         doom_loop_triggers: Vec<String>,
-        usage: Option<LanguageModelUsage>,
+        usage: Option<TokenUsage>,
     },
     Retry(crate::retry::RetryStatus),
     StreamRollback {
@@ -29,8 +29,11 @@ pub enum ChunkType {
     },
     Warning(String),
     Metadata(String),
-    /// Provider-reported token usage for one model request.
-    Usage(LanguageModelUsage),
+    /// Provider-billed token usage for the current step.
+    ///
+    /// `input` is non-cached prompt tokens. Cache hits/writes are separate so
+    /// hosts can price them at different rates.
+    Usage(TokenUsage),
     End {
         reason: Option<FinishReason>,
     },
@@ -82,6 +85,37 @@ impl ReasoningReplayItem {
         self.id.as_deref().is_none_or(str::is_empty)
             && self.summary.is_empty()
             && self.encrypted_content.as_deref().is_none_or(str::is_empty)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    /// Non-cached input tokens.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TokenUsage {
+    pub fn is_empty(self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+
+    pub fn total(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+        }
     }
 }
 

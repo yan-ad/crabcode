@@ -287,16 +287,30 @@ fn load_sessions(conn: &Connection) -> Result<Vec<SessionRow>> {
 fn load_messages(conn: &Connection) -> Result<Vec<MessageRow>> {
     let mut statement = conn.prepare(
         "SELECT session_id, timestamp, parts, model, provider,
-                COALESCE(output_tokens, tokens_used, 0)
+                COALESCE(output_tokens, tokens_used, 0),
+                input_tokens, cache_read_tokens, cache_write_tokens, cost,
+                usage_authoritative
          FROM messages",
     )?;
     let rows = statement.query_map([], |row| {
         let output_tokens: i64 = row.get(5)?;
-        let usage = usage_from_parts(&row.get::<_, String>(2)?, output_tokens.max(0) as u64);
+        let parts: String = row.get(2)?;
+        let usage_authoritative: bool = row.get(10)?;
+        let usage = if usage_authoritative {
+            UsageTotals {
+                input: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                output: output_tokens.max(0) as u64,
+                cache_read: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+                cache_write: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
+                cost: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+            }
+        } else {
+            usage_from_parts(&parts, output_tokens.max(0) as u64)
+        };
         Ok(MessageRow {
             session_id: row.get(0)?,
             timestamp: row.get(1)?,
-            parts: row.get(2)?,
+            parts,
             model: row.get(3)?,
             provider: row.get(4)?,
             usage,
@@ -375,9 +389,9 @@ fn render_overview(report: &StatsReport) -> String {
     render_table(
         "OVERVIEW",
         &[
-            ("Sessions", report.sessions.to_string()),
-            ("Messages", report.messages.to_string()),
-            ("Days", report.days.to_string()),
+            ("Sessions", comma_number(report.sessions as u64)),
+            ("Messages", comma_number(report.messages as u64)),
+            ("Days", comma_number(report.days as u64)),
         ],
     )
 }
@@ -413,7 +427,7 @@ fn render_models(models: &[(String, ModelStats)]) -> String {
     let mut lines = vec![top_border(), model_title_row(), middle_border()];
     for (index, (name, stats)) in models.iter().enumerate() {
         lines.push(text_row(&format!(" {name}")));
-        lines.push(metric_row("  Messages", &stats.messages.to_string()));
+        lines.push(metric_row("  Messages", &comma_number(stats.messages)));
         lines.push(metric_row(
             "  Input Tokens",
             &compact_number(stats.usage.input),
@@ -514,6 +528,18 @@ fn truncate(value: &str, width: usize) -> String {
     format!("{}..", value.chars().take(width - 2).collect::<String>())
 }
 
+fn comma_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
+}
+
 fn compact_number(value: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (1_000_000_000, "B"),
@@ -599,6 +625,38 @@ mod tests {
     }
 
     #[test]
+    fn compaction_summary_usage_counts_toward_totals() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO messages
+             (id, session_id, role, parts, timestamp, tokens_used, output_tokens, model, provider)
+             VALUES
+             ('m4', 1, 'user', ?1, 1002, 92400, 400, 'gpt-test', 'openai')",
+            params![
+                r#"[{"type":"text","text":"Another language model started to solve this problem"},{"type":"usage","input":80000,"output":400,"cache_read":12000,"cache_write":0,"cost":0.42}]"#
+            ],
+        )
+        .unwrap();
+
+        let report = collect(
+            &conn,
+            &StatsOptions {
+                models: Some(None),
+                ..StatsOptions::default()
+            },
+            100_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.usage.input, 84_000);
+        assert_eq!(report.usage.output, 2_400);
+        assert_eq!(report.usage.cache_read, 15_000);
+        assert!((report.usage.cost - 0.545).abs() < 1e-9);
+        assert_eq!(report.models[0].1.messages, 3);
+        assert_eq!(report.models[0].1.usage.input, 84_000);
+    }
+
+    #[test]
     fn days_filter_counts_only_active_sessions_and_uses_requested_days() {
         let report = collect(
             &test_db(),
@@ -641,6 +699,7 @@ mod tests {
         assert!(output.contains("│Sessions                                              2 │"));
         assert!(output.contains("│Output                                             2.0K │"));
         assert!(output.contains("│                      TOOL USAGE                        │"));
+        assert!(output.contains(" read               ████████████████████ 2 (66.7%)"));
         assert!(output
             .lines()
             .filter(|line| !line.is_empty())
@@ -654,5 +713,52 @@ mod tests {
         assert_eq!(compact_number(1_000), "1.0K");
         assert_eq!(compact_number(10_600_000), "10.6M");
         assert_eq!(compact_number(1_310_600_000), "1.3B");
+    }
+
+    #[test]
+    fn comma_numbers_group_thousands() {
+        assert_eq!(comma_number(0), "0");
+        assert_eq!(comma_number(121), "121");
+        assert_eq!(comma_number(999), "999");
+        assert_eq!(comma_number(1_000), "1,000");
+        assert_eq!(comma_number(4_499), "4,499");
+        assert_eq!(comma_number(30_446), "30,446");
+        assert_eq!(comma_number(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn overview_and_model_counts_use_commas_not_compact() {
+        let output = render(
+            &StatsReport {
+                sessions: 4_499,
+                messages: 30_446,
+                days: 121,
+                models: vec![(
+                    "openai/gpt-test".into(),
+                    ModelStats {
+                        messages: 12_345,
+                        usage: UsageTotals {
+                            input: 4_000,
+                            ..UsageTotals::default()
+                        },
+                    },
+                )],
+                tools: vec![("read".into(), 1234)],
+                tool_total: 1234,
+                ..StatsReport::default()
+            },
+            &StatsOptions {
+                models: Some(None),
+                ..StatsOptions::default()
+            },
+        );
+
+        assert!(output.contains("│Sessions                                          4,499 │"));
+        assert!(output.contains("│Messages                                         30,446 │"));
+        assert!(output.contains("│Days                                                121 │"));
+        assert!(output.contains("│  Messages                                       12,345 │"));
+        assert!(output.contains("│  Input Tokens                                     4.0K │"));
+        assert!(output.contains(" read               ████████████████████ 1234 (100.0%)"));
+        assert!(!output.contains("1,234 (100.0%)"));
     }
 }

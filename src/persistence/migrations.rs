@@ -95,6 +95,7 @@ fn migrate_to_v1(db: &mut Connection) -> Result<()> {
             t1_ms INTEGER,
             tn_ms INTEGER,
             output_tokens INTEGER,
+            tokens_per_sec REAL,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
@@ -156,6 +157,9 @@ fn migrate_to_v4(db: &mut Connection) -> Result<()> {
         "ALTER TABLE messages ADD COLUMN usage_authoritative INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Precomputed inter-token TPS so a reloaded session shows the same t/s
+    // as the live stream instead of recomputing from token estimates.
+    let _ = tx.execute("ALTER TABLE messages ADD COLUMN tokens_per_sec REAL", []);
     tx.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at) VALUES (4, strftime('%s', 'now'))",
         params![],

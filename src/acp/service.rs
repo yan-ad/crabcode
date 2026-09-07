@@ -1186,8 +1186,12 @@ impl AcpService {
                     session.provider.clone_from(&model.provider_id);
                     session.model.clone_from(&model.id);
                     session.reasoning = resolved_reasoning(&session, session.reasoning_selection);
-                    session.context_window =
-                        model_context_window(&session.config, &session.provider, &session.model);
+                    session.context_window = model_context_window(
+                        &session.config,
+                        &session.models,
+                        &session.provider,
+                        &session.model,
+                    );
                 }
                 Some(prompt)
             }
@@ -1392,13 +1396,20 @@ impl AcpService {
                     assistant
                         .parts
                         .push(crate::session::types::MessagePart::usage(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cache_read_tokens,
-                            usage.cache_write_tokens,
-                            0.0,
+                            usage.input,
+                            usage.output,
+                            usage.cache_read,
+                            usage.cache_write,
+                            estimate_session_usage_cost(&session, &usage),
                         ));
-                    assistant.output_tokens = Some(usage.output_tokens as usize);
+                    if usage.output > 0 {
+                        assistant.output_tokens = Some(
+                            assistant
+                                .output_tokens
+                                .unwrap_or(0)
+                                .saturating_add(usage.output as usize),
+                        );
+                    }
                 }
                 crate::llm::ChunkMessage::Cancelled => cancelled = true,
                 crate::llm::ChunkMessage::Failed(error) => failed = Some(error),
@@ -1618,7 +1629,7 @@ fn compaction_reasoning(session: &AcpSession) -> Option<crate::model::reasoning:
 fn compacted_messages(
     messages: &[crate::session::types::Message],
     selection: &crate::session::compaction::CompactionSelection,
-    summary: &str,
+    summary: &crate::llm::client::CompactionSummary,
     session: &AcpSession,
     before_tokens: usize,
     before_messages: usize,
@@ -1632,7 +1643,7 @@ fn compacted_messages(
     let mut compacted = crate::session::compaction::apply_soft_compaction(
         messages,
         selection,
-        summary,
+        &summary.text,
         Some(session.model.clone()),
         Some(session.provider.clone()),
         Some(session.agent.clone()),
@@ -1641,6 +1652,16 @@ fn compacted_messages(
             after_tokens: 0,
             before_messages,
             after_messages: 0,
+        },
+    );
+    crate::session::compaction::attach_summary_usage(
+        &mut compacted,
+        crate::session::types::RecordedUsage {
+            input: summary.usage.input,
+            output: summary.usage.output,
+            cache_read: summary.usage.cache_read,
+            cache_write: summary.usage.cache_write,
+            cost: estimate_session_usage_cost(session, &summary.usage),
         },
     );
     let after_tokens = crate::session::compaction::total_context_tokens(&compacted);
@@ -1849,6 +1870,27 @@ fn model_reasoning_capability(
     .ok()
     .and_then(|discovery| discovery.get_model_reasoning_capability(provider, model_id))
     .filter(|capability| !capability.values().is_empty())
+}
+
+fn estimate_session_usage_cost(
+    session: &AcpSession,
+    usage: &crate::aisdk::chunk::TokenUsage,
+) -> f64 {
+    crate::model::discovery::Discovery::new_with_custom(Some(
+        session.config.merged_config.custom_providers.clone(),
+    ))
+    .ok()
+    .map(|discovery| {
+        discovery.estimate_usage_cost(
+            &session.provider,
+            &session.model,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+        )
+    })
+    .unwrap_or(0.0)
 }
 
 fn model_context_window(
@@ -3203,7 +3245,10 @@ mod tests {
         let (compacted, stats) = compacted_messages(
             &messages,
             &selection,
-            "short handoff",
+            &crate::llm::client::CompactionSummary {
+                text: "short handoff".to_string(),
+                usage: Default::default(),
+            },
             &session,
             before_tokens,
             before_messages,
@@ -3703,5 +3748,27 @@ mod tests {
                 ("max".to_string(), "Max".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn unknown_model_usage_cost_is_zero() {
+        let mut session = session_with_config(LoadedConfig {
+            merged_config: crate::config::configuration::MergedConfig::default(),
+            raw_merged: serde_json::Value::Null,
+            diagnostics: Default::default(),
+            inventory: Default::default(),
+            project_root: PathBuf::from("/tmp"),
+            cwd: PathBuf::from("/tmp"),
+            xdg_config_home: PathBuf::from("/tmp"),
+        });
+        session.provider = "no-such-provider".to_string();
+        session.model = "no-such-model".to_string();
+        let usage = crate::aisdk::chunk::TokenUsage {
+            input: 1_000,
+            output: 1_000,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        assert_eq!(estimate_session_usage_cost(&session, &usage), 0.0);
     }
 }

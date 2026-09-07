@@ -37,7 +37,7 @@ use crate::views::agents_dialog::{
     render_agents_dialog, AgentsDialogAction,
 };
 use crate::views::chat::{
-    agent_color_for_tab, init_chat, queued_messages_height, render_chat,
+    agent_color_for_tab, chat_input_height, init_chat, queued_messages_height, render_chat,
     render_subagent_spinner_only, SubagentTab, SubagentTabs, SUBAGENT_FOOTER_HEIGHT,
 };
 use crate::views::command_palette::{
@@ -360,6 +360,44 @@ struct ModelsTaskMessage {
 #[derive(Debug)]
 enum TitleGenerationTaskMessage {
     Generated { session_id: String, title: String },
+}
+
+/// Answer to a `/btw` side question. Kept out of `chat_state.chat.messages`
+/// (and session persistence) so the aside never leaks into the main turn.
+/// `session_id` is `None` on the home page.
+#[derive(Debug, Clone)]
+pub struct BtwEntry {
+    pub session_id: Option<String>,
+    pub question: String,
+    pub answer: Option<String>,
+    pub error: Option<String>,
+}
+
+impl BtwEntry {
+    pub fn pending(session_id: Option<String>, question: String) -> Self {
+        Self {
+            session_id,
+            question,
+            answer: None,
+            error: None,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.answer.is_none() && self.error.is_none()
+    }
+}
+
+#[derive(Debug)]
+enum BtwTaskMessage {
+    Answered {
+        session_id: Option<String>,
+        answer: String,
+    },
+    Failed {
+        session_id: Option<String>,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -890,6 +928,12 @@ pub struct App {
     models_dialog_provider_ids: Option<Vec<String>>,
     title_generation_receiver:
         Option<tokio::sync::mpsc::UnboundedReceiver<TitleGenerationTaskMessage>>,
+    btw_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<BtwTaskMessage>>,
+    btw_entries: Vec<BtwEntry>,
+    /// Lines scrolled down from the top inside the `/btw` panel (0 = top).
+    btw_scroll: usize,
+    /// Last-rendered `/btw` panel rect, for mouse-wheel hit-testing.
+    btw_panel_area: Option<ratatui::layout::Rect>,
     pub prefs_dao: Option<crate::persistence::PrefsDAO>,
     pub agent: String,
     pub agent_registry: crate::agent::definition::AgentRegistry,
@@ -1153,6 +1197,10 @@ impl App {
             models_receiver: None,
             models_dialog_provider_ids: None,
             title_generation_receiver: None,
+            btw_receiver: None,
+            btw_entries: Vec::new(),
+            btw_scroll: 0,
+            btw_panel_area: None,
             prefs_dao,
             agent,
             agent_registry: crate::agent::definition::AgentRegistry::default(),
@@ -1716,17 +1764,18 @@ impl App {
             msg.role == crate::session::types::MessageRole::Assistant && msg.is_complete
         })?;
 
+        // Upstream formula (opencode #46108): billed output / decode time,
+        // 250ms floor, no inter-token adjustment.
         let format_tps = |precomputed: Option<f64>, tokens: usize, decode_ms: u64| -> Option<f64> {
             if let Some(tps) = precomputed {
                 if tps.is_finite() && tps > 0.0 {
                     return Some(tps);
                 }
             }
-            // OpenCode inter-token: (n - 1) / duration; need >1 token.
-            if decode_ms == 0 || tokens < 2 {
+            if tokens == 0 || decode_ms < 250 {
                 return None;
             }
-            let tps = ((tokens - 1) as f64) / (decode_ms as f64 / 1000.0);
+            let tps = tokens as f64 / (decode_ms as f64 / 1000.0);
             if tps.is_finite() && tps > 0.0 {
                 Some(tps)
             } else {
@@ -1735,7 +1784,9 @@ impl App {
         };
 
         if let (Some(t0), Some(t1), Some(tn)) = (message.t0_ms, message.t1_ms, message.tn_ms) {
-            let output_tokens = message.output_tokens.or(message.token_count).unwrap_or(0);
+            // t/s inputs are output tokens only — `token_count` is the billed
+            // total and would inflate the rate on reloaded sessions.
+            let output_tokens = message.output_tokens.unwrap_or(0);
             let ttft_ms = t1.saturating_sub(t0);
             let decode_ms = message.duration_ms.unwrap_or_else(|| tn.saturating_sub(t1));
             let total_ms = ttft_ms.saturating_add(decode_ms);
@@ -1749,13 +1800,21 @@ impl App {
             return Some(format!("{:.1}s", total_sec));
         }
 
-        if let (Some(token_count), Some(duration_ms)) = (message.token_count, message.duration_ms) {
+        if let (Some(output_tokens), Some(duration_ms)) =
+            (message.output_tokens, message.duration_ms)
+        {
             let duration_sec = duration_ms as f64 / 1000.0;
             if let Some(tokens_per_sec) =
-                format_tps(message.tokens_per_sec, token_count, duration_ms)
+                format_tps(message.tokens_per_sec, output_tokens, duration_ms)
             {
                 return Some(format!("{:.1}s | {:.0}t/s", duration_sec, tokens_per_sec));
             }
+            return Some(format!("{:.1}s", duration_sec));
+        }
+
+        if message.duration_ms.is_some() {
+            // Total-only legacy row: duration without t/s.
+            let duration_sec = message.duration_ms.unwrap_or(0) as f64 / 1000.0;
             return Some(format!("{:.1}s", duration_sec));
         }
 
@@ -1970,17 +2029,24 @@ impl App {
     /// Rows under the chat viewport (queue/input/help/status) for dialog overlap math.
     fn dialog_below_chat_height(&self, size: ratatui::layout::Rect) -> u16 {
         let is_subagent = self.is_subagent_session_active();
-        let input_height = if is_subagent {
-            SUBAGENT_FOOTER_HEIGHT
-        } else {
-            self.input.get_height_for_width(size.width)
-        };
         let help_height = if is_subagent { 0 } else { 1 };
         let queue_height = if is_subagent {
             0
         } else {
             crate::views::chat::queued_messages_height(
                 &self.queued_message_previews_for_current_session(),
+            )
+        };
+        let input_height = if is_subagent {
+            SUBAGENT_FOOTER_HEIGHT
+        } else {
+            chat_input_height(
+                &self.input,
+                size.width,
+                size.height,
+                queue_height,
+                0,
+                help_height,
             )
         };
         // Matches render_chat: queue + input + help + inner status row + outer status bar.
@@ -2556,12 +2622,30 @@ impl App {
         format!("Ask anything... \"{}\"", suggestions[index])
     }
 
+    fn mcp_tool_prefix_tokens(&self) -> usize {
+        let Some(manager) = self.mcp_manager.as_ref() else {
+            return 0;
+        };
+        let Ok(manager) = manager.try_lock() else {
+            return 0;
+        };
+        manager
+            .tools()
+            .iter()
+            .map(|spec| {
+                let schema_len = spec.input_schema.to_string().len();
+                (spec.tool_id.len() + spec.description.len() + schema_len) / 4
+            })
+            .sum()
+    }
+
     fn session_usage_text(&mut self) -> String {
         let total_tokens = if self.is_streaming {
             self.streaming_context_tokens_cached()
         } else {
             crate::session::compaction::total_context_tokens(&self.chat_state.chat.messages)
-        };
+        }
+        .saturating_add(self.mcp_tool_prefix_tokens());
         let messages = &self.chat_state.chat.messages;
 
         let mut text = if total_tokens == 0 {
@@ -2580,18 +2664,11 @@ impl App {
                         text = format!("{} ({}%)", text, pct);
                     }
                 }
+            }
 
-                if let Some(cost) =
-                    discovery.get_model_pricing(&self.provider_name.to_lowercase(), &self.model)
-                {
-                    let output_tokens: usize =
-                        messages.iter().filter_map(|m| m.output_tokens).sum();
-                    let total = (output_tokens.max(total_tokens)) as f64;
-                    let price = total / 1_000_000.0 * cost.output;
-                    if price > 0.001 {
-                        text = format!("{} \u{00b7} ${:.2}", text, price);
-                    }
-                }
+            let session_cost: f64 = messages.iter().map(|message| message.usage_cost()).sum();
+            if session_cost > 0.001 {
+                text = format!("{} \u{00b7} ${:.2}", text, session_cost);
             }
         }
 
@@ -2829,6 +2906,19 @@ impl App {
     fn active_reasoning_effort_label(&self) -> Option<String> {
         self.active_reasoning_effort()
             .map(|effort| effort.as_str().to_string())
+    }
+
+    fn active_reasoning_effort_explicit(&self) -> bool {
+        self.reasoning_effort_override_for_model(&self.provider_name, &self.model)
+            .is_some()
+    }
+
+    fn selected_model_reasoning_effort_explicit(&self) -> bool {
+        let Some(selected) = self.models_dialog_state.dialog.get_selected() else {
+            return false;
+        };
+        self.reasoning_effort_override_for_model(&selected.provider_id, &selected.id)
+            .is_some()
     }
 
     fn model_name_for_display(&self, provider_id: &str, model_id: &str) -> String {
@@ -3279,6 +3369,35 @@ impl App {
         had_selection
     }
 
+    /// Shift+navigation extends (or shrinks) the input selection instead of
+    /// clearing it, so the copy tooltip must stay alive across these keys.
+    fn is_selection_extend_key(key: KeyEvent) -> bool {
+        key.modifiers.contains(event::KeyModifiers::SHIFT)
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+    }
+
+    /// Mirror the mouse-drag behavior for keyboard selections: show the `y`
+    /// copy bar as soon as Shift+arrows select text, hide it once the
+    /// selection is gone.
+    fn sync_input_selection_action_bar(&mut self) {
+        if self.input.has_selection() && !self.input.get_selected_text().is_empty() {
+            self.show_selection_action_bar_for(SelectionActionTarget::Input);
+        } else if matches!(
+            self.selection_action_bar,
+            Some(state) if state.target == SelectionActionTarget::Input
+        ) {
+            self.selection_action_bar = None;
+        }
+    }
+
     fn add_selection_to_prompt(&mut self, target: SelectionActionTarget) -> bool {
         if target != SelectionActionTarget::Chat {
             return false;
@@ -3353,11 +3472,6 @@ impl App {
                 .as_ref(),
             )
             .split(size);
-        let input_height = if self.is_subagent_session_active() {
-            SUBAGENT_FOOTER_HEIGHT
-        } else {
-            self.input.get_height_for_width(size.width)
-        };
         let help_height = if self.is_subagent_session_active() {
             0
         } else {
@@ -3368,6 +3482,18 @@ impl App {
             0
         } else {
             queued_messages_height(&queued_messages)
+        };
+        let input_height = if self.is_subagent_session_active() {
+            SUBAGENT_FOOTER_HEIGHT
+        } else {
+            chat_input_height(
+                &self.input,
+                size.width,
+                size.height,
+                queue_height,
+                0,
+                help_height,
+            )
         };
         let above_status_chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
@@ -3459,6 +3585,14 @@ impl App {
     }
 
     pub fn handle_coalesced_mouse_scroll(&mut self, mouse: MouseEvent, notches: usize) {
+        // The /btw panel scrolls independently (home and chat alike).
+        if matches!(
+            self.overlay_focus,
+            OverlayFocus::None | OverlayFocus::FindBar
+        ) && self.handle_btw_mouse_scroll(mouse, notches)
+        {
+            return;
+        }
         if matches!(
             self.overlay_focus,
             OverlayFocus::None | OverlayFocus::FindBar
@@ -3643,6 +3777,7 @@ impl App {
                 } else {
                     let input_handled = self.input.handle_event(key);
                     self.update_suggestions();
+                    self.sync_input_selection_action_bar();
                     input_handled
                 }
             }
@@ -4276,6 +4411,10 @@ impl App {
                         self.overlay_focus = OverlayFocus::None;
                         self.chat_state.chat.toggle_thinking_visible();
                     }
+                    crate::views::which_key::WhichKeyAction::ShowCopyDialog => {
+                        self.overlay_focus = OverlayFocus::None;
+                        self.open_copy_actions_dialog();
+                    }
                     crate::views::which_key::WhichKeyAction::GoChild => {
                         self.overlay_focus = OverlayFocus::None;
                         let _ = self.switch_to_latest_child_session();
@@ -4403,6 +4542,11 @@ impl App {
             KeyCode::Esc => {
                 // If text is selected, clear selection first
                 if self.clear_selection() {
+                    self.reset_esc_primed_state();
+                    return true;
+                }
+                // Close the /btw side panel first (works while streaming too).
+                if self.input.is_empty() && self.dismiss_btw_panel() {
                     self.reset_esc_primed_state();
                     return true;
                 }
@@ -4621,7 +4765,17 @@ impl App {
     }
 
     fn handle_input_and_app_keys(&mut self, key: KeyEvent) {
-        if self.selection_action_bar.is_some() {
+        if Self::is_selection_extend_key(key) {
+            // Shift+arrows extend the input selection: clear any chat-side
+            // selection/bar but never the input selection itself.
+            self.chat_state.chat.selection.clear();
+            if !matches!(
+                self.selection_action_bar,
+                Some(state) if state.target == SelectionActionTarget::Input
+            ) {
+                self.selection_action_bar = None;
+            }
+        } else if self.selection_action_bar.is_some() {
             self.dismiss_selection_actions();
         } else {
             self.chat_state.chat.selection.clear();
@@ -4630,6 +4784,7 @@ impl App {
         if self.is_subagent_session_active() {
             if Self::is_input_navigation_key(key) {
                 self.input.handle_event(key);
+                self.sync_input_selection_action_bar();
             }
             clear_suggestions(&mut self.suggestions_popup_state);
             self.overlay_focus = OverlayFocus::None;
@@ -4691,11 +4846,13 @@ impl App {
                         self.input.clear();
                     }
                     self.clear_suggestions_and_blur();
+                    self.sync_input_selection_action_bar();
                 }
             }
             _ => {
                 self.input.handle_event(key);
                 self.update_suggestions();
+                self.sync_input_selection_action_bar();
             }
         }
     }
@@ -4737,7 +4894,6 @@ impl App {
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([ratatui::layout::Constraint::Min(0)].as_ref())
             .split(self.last_frame_size);
-        let input_height = self.input.get_height_for_width(self.last_frame_size.width);
         let queued_messages = self.queued_message_previews_for_current_session();
         let queue_height =
             if self.base_focus == BaseFocus::Chat && !self.is_subagent_session_active() {
@@ -4745,6 +4901,14 @@ impl App {
             } else {
                 0
             };
+        let input_height = chat_input_height(
+            &self.input,
+            self.last_frame_size.width,
+            self.last_frame_size.height,
+            queue_height,
+            0,
+            1,
+        );
         let input_chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints(
@@ -6183,14 +6347,25 @@ impl App {
     }
 
     fn open_copy_actions_dialog(&mut self) {
-        let mut dialog = ActionDialog::with_items(
-            "Copy",
+        let model_item = ActionDialogItem {
+            id: "model".to_string(),
+            key: 'm',
+            label: "Copy provider+model id".to_string(),
+            description: "Active provider/model identifier".to_string(),
+        };
+        let items = if self.base_focus == BaseFocus::Chat {
             vec![
                 ActionDialogItem {
                     id: "transcript".to_string(),
                     key: 't',
                     label: "Copy session transcript".to_string(),
                     description: "Full conversation as Markdown".to_string(),
+                },
+                ActionDialogItem {
+                    id: "input".to_string(),
+                    key: 'c',
+                    label: "Copy current chat input".to_string(),
+                    description: "Current draft in the input box".to_string(),
                 },
                 ActionDialogItem {
                     id: "id".to_string(),
@@ -6204,8 +6379,12 @@ impl App {
                     label: "Copy session title".to_string(),
                     description: "Current session name".to_string(),
                 },
-            ],
-        );
+                model_item,
+            ]
+        } else {
+            vec![model_item]
+        };
+        let mut dialog = ActionDialog::with_items("Copy", items);
         dialog.show();
         self.copy_actions_dialog = Some(dialog);
         self.overlay_focus = OverlayFocus::CopyActions;
@@ -6213,7 +6392,12 @@ impl App {
 
     fn execute_copy_action(&mut self, action: &str) {
         match action {
+            "model" => {
+                let text = format!("{}/{}", self.provider_name, self.model);
+                self.copy_text_with_toast(&text, "Provider+model id copied to clipboard");
+            }
             "transcript" => self.copy_session_transcript(),
+            "input" => self.copy_current_chat_input(),
             "id" => {
                 let Some(id) = self.session_manager.get_current_session_id().cloned() else {
                     self.play_sound_event(crate::sound::SoundEvent::Error);
@@ -6248,6 +6432,20 @@ impl App {
         }
 
         self.close_copy_actions_dialog();
+    }
+
+    fn copy_current_chat_input(&mut self) {
+        let text = self.input.submission_text();
+        if text.trim().is_empty() {
+            self.play_sound_event(crate::sound::SoundEvent::Error);
+            push_toast(Toast::new(
+                "No chat input to copy",
+                ToastLevel::Error,
+                Some(std::time::Duration::from_secs(3)),
+            ));
+            return;
+        }
+        self.copy_text_with_toast(&text, "Chat input copied to clipboard");
     }
 
     fn copy_text_with_toast(&mut self, text: &str, success_message: &'static str) {
@@ -6521,6 +6719,9 @@ impl App {
         let agent = self.agent.clone();
         let original_messages = messages;
         let task_session_id = session_id.to_string();
+        let compaction_pricing = self.discovery.as_ref().and_then(|discovery| {
+            discovery.get_model_pricing(&self.provider_name.to_lowercase(), &self.model)
+        });
 
         tokio::spawn(async move {
             let result = crate::llm::client::summarize_for_compaction(
@@ -6541,7 +6742,7 @@ impl App {
                 let mut messages = crate::session::compaction::apply_soft_compaction(
                     &original_messages,
                     &selection,
-                    &summary,
+                    &summary.text,
                     Some(model),
                     Some(provider_name),
                     Some(agent),
@@ -6550,6 +6751,27 @@ impl App {
                         after_tokens: 0,
                         before_messages,
                         after_messages: 0,
+                    },
+                );
+                let cost = compaction_pricing
+                    .as_ref()
+                    .map(|pricing| {
+                        pricing.estimate_tokens(
+                            summary.usage.input,
+                            summary.usage.output,
+                            summary.usage.cache_read,
+                            summary.usage.cache_write,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                crate::session::compaction::attach_summary_usage(
+                    &mut messages,
+                    crate::session::types::RecordedUsage {
+                        input: summary.usage.input,
+                        output: summary.usage.output,
+                        cache_read: summary.usage.cache_read,
+                        cache_write: summary.usage.cache_write,
+                        cost,
                     },
                 );
                 // Count post-boundary context only (new layout:
@@ -6746,6 +6968,10 @@ impl App {
                 if self.command_matches(&parsed.name, "fork") && self.base_focus == BaseFocus::Chat
                 {
                     self.handle_fork_command(&parsed.args);
+                    return;
+                }
+                if self.command_matches(&parsed.name, "btw") {
+                    self.handle_btw_command(&parsed);
                     return;
                 }
                 if self.reject_chat_only_command_outside_chat(&parsed.name) {
@@ -6982,6 +7208,10 @@ impl App {
         }
         if self.command_matches(&parsed.name, "fork") && self.base_focus == BaseFocus::Chat {
             self.handle_fork_command(&parsed.args);
+            return;
+        }
+        if self.command_matches(&parsed.name, "btw") {
+            self.handle_btw_command(&parsed);
             return;
         }
         if self.reject_chat_only_command_outside_chat(&parsed.name) {
@@ -7566,11 +7796,15 @@ impl App {
                     return;
                 }
 
-                let undone_message: Option<crate::session::types::Message> = {
+                let (undone_message, removed_count): (
+                    Option<crate::session::types::Message>,
+                    usize,
+                ) = {
                     if let Some(session) = self.session_manager.get_current_session() {
+                        let len = session.messages.len();
                         let message = session.messages.get(idx).cloned();
                         session.messages.truncate(idx);
-                        message
+                        (message, len.saturating_sub(idx))
                     } else {
                         return;
                     }
@@ -7599,7 +7833,7 @@ impl App {
                 }
 
                 push_toast(Toast::new(
-                    format!("Removed {} message(s)", idx),
+                    format!("Removed {} message(s)", removed_count),
                     ToastLevel::Info,
                     None,
                 ));
@@ -9349,6 +9583,189 @@ impl App {
         }
     }
 
+    /// Fire a `/btw` side question: lightweight no-tools call that bypasses the
+    /// main streaming turn. Works on home and chat, and while the agent is busy;
+    /// the Q&A stays out of `chat_state.chat.messages` so it never leaks into
+    /// the main turn.
+    fn handle_btw_command(&mut self, parsed: &crate::command::parser::ParsedCommand) {
+        let question = parsed.raw_args().trim().to_string();
+        if question.is_empty() {
+            self.push_command_error("Usage: /btw <question>");
+            return;
+        }
+        // No active session on the home page — key the entry to `None` there.
+        let session_id = self.session_manager.get_current_session_id().cloned();
+        if self.btw_receiver.is_some() {
+            push_toast(Toast::new(
+                "Already answering a /btw question...",
+                ToastLevel::Info,
+                Some(std::time::Duration::from_secs(2)),
+            ));
+            return;
+        }
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.btw_receiver = Some(receiver);
+        self.btw_entries
+            .push(BtwEntry::pending(session_id.clone(), question.clone()));
+        // Pin to the top of the fresh panel.
+        self.btw_scroll = 0;
+        self.note_user_activity();
+
+        let provider = self.provider_name.clone();
+        let model = self.model.clone();
+        // Snapshot history for context (Grok resolves history server-side via
+        // session_id; we attach the optimized slice client-side).
+        let history: Vec<crate::session::types::Message> = session_id
+            .as_deref()
+            .and_then(|id| self.chat_for_session(id))
+            .map(|chat| chat.messages.clone())
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            let message =
+                match crate::llm::client::generate_btw_answer(provider, model, question, history)
+                    .await
+                {
+                    Ok(answer) => BtwTaskMessage::Answered { session_id, answer },
+                    Err(err) => BtwTaskMessage::Failed {
+                        session_id,
+                        error: err.to_string(),
+                    },
+                };
+            let _ = sender.send(message);
+        });
+    }
+
+    /// Latest `/btw` entry for the current context (home or active session).
+    pub fn current_btw_entry(&self) -> Option<&BtwEntry> {
+        let session_id = self.session_manager.get_current_session_id().cloned();
+        self.btw_entries
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id)
+    }
+
+    /// Close the `/btw` panel for the current context (Esc). A late reply to
+    /// an already-closed panel is dropped.
+    pub fn dismiss_btw_panel(&mut self) -> bool {
+        let session_id = self.session_manager.get_current_session_id().cloned();
+        let before = self.btw_entries.len();
+        self.btw_entries
+            .retain(|entry| entry.session_id != session_id);
+        if before == self.btw_entries.len() {
+            return false;
+        }
+        // Drop the in-flight receiver too so a late reply is discarded and a
+        // fresh /btw can start immediately.
+        self.btw_receiver = None;
+        self.btw_scroll = 0;
+        true
+    }
+
+    /// Max scroll offset (in body lines) for the current `/btw` panel.
+    /// Derived from the panel's actual rendered area (not a width guess) so
+    /// the wrap and the viewport always match, even on small terminals.
+    fn btw_scroll_max(&self, colors: &crate::theme::ThemeColors) -> usize {
+        let Some(area) = self.btw_panel_area else {
+            return 0;
+        };
+        let Some(entry) = self.current_btw_entry() else {
+            return 0;
+        };
+        let total = crate::views::chat::btw_body_lines(
+            entry,
+            crate::views::chat::btw_body_width(area.width),
+            colors,
+        )
+        .len()
+        .max(1);
+        total.saturating_sub(crate::views::chat::btw_body_viewport(area.height))
+    }
+
+    /// Mouse-wheel scroll inside the `/btw` panel. Returns true when consumed.
+    fn handle_btw_mouse_scroll(&mut self, mouse: MouseEvent, notches: usize) -> bool {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            return false;
+        }
+        if self.current_btw_entry().is_none() {
+            return false;
+        }
+        let Some(area) = self.btw_panel_area else {
+            return false;
+        };
+        if !area.contains(Position::new(mouse.column, mouse.row)) {
+            return false;
+        }
+        let colors = self.get_current_theme_colors();
+        let max = self.btw_scroll_max(&colors);
+        let step = notches.max(1) * 3;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.btw_scroll = self.btw_scroll.saturating_sub(step).min(max);
+            }
+            _ => {
+                self.btw_scroll = self.btw_scroll.saturating_add(step).min(max);
+            }
+        }
+        true
+    }
+
+    fn process_btw_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = &mut self.btw_receiver {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        } else {
+            return;
+        }
+        if let Some(receiver) = &self.btw_receiver {
+            disconnected = receiver.is_closed() && receiver.is_empty();
+        }
+
+        if disconnected {
+            self.btw_receiver = None;
+        }
+
+        for event in events {
+            match event {
+                BtwTaskMessage::Answered { session_id, answer } => {
+                    if let Some(entry) = self
+                        .btw_entries
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| entry.session_id == session_id && entry.is_pending())
+                    {
+                        entry.answer = Some(answer);
+                    }
+                    self.btw_receiver = None;
+                    self.play_sound_event(crate::sound::SoundEvent::Complete);
+                }
+                BtwTaskMessage::Failed { session_id, error } => {
+                    if let Some(entry) = self
+                        .btw_entries
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| entry.session_id == session_id && entry.is_pending())
+                    {
+                        entry.error = Some(error.clone());
+                    }
+                    self.btw_receiver = None;
+                    self.play_sound_event(crate::sound::SoundEvent::Error);
+                    push_toast(Toast::new(
+                        format!("btw failed: {}", error),
+                        ToastLevel::Error,
+                        Some(std::time::Duration::from_secs(4)),
+                    ));
+                }
+            }
+        }
+    }
+
     fn cleanup_streaming(&mut self) {
         if let Some(session_id) = self.session_manager.get_current_session_id().cloned() {
             self.cleanup_streaming_for_session(&session_id);
@@ -9627,6 +10044,7 @@ impl App {
         self.process_storage_events();
         self.process_models_events();
         self.process_title_generation_events();
+        self.process_btw_events();
 
         let drained = {
             let mut receivers = Vec::new();
@@ -9733,25 +10151,23 @@ impl App {
                 let cost = self
                     .discovery
                     .as_ref()
-                    .and_then(|discovery| {
-                        discovery.get_model_pricing(&self.provider_name.to_lowercase(), &self.model)
-                    })
-                    .map(|pricing| {
-                        let per_million = 1_000_000.0;
-                        usage.input_tokens as f64 / per_million * pricing.input
-                            + usage.output_tokens as f64 / per_million * pricing.output
-                            + usage.cache_read_tokens as f64 / per_million
-                                * pricing.cache_read.unwrap_or(pricing.input)
-                            + usage.cache_write_tokens as f64 / per_million
-                                * pricing.cache_write.unwrap_or(pricing.input)
+                    .map(|discovery| {
+                        discovery.estimate_usage_cost(
+                            &self.provider_name,
+                            &self.model,
+                            usage.input,
+                            usage.output,
+                            usage.cache_read,
+                            usage.cache_write,
+                        )
                     })
                     .unwrap_or(0.0);
                 if let Some(chat) = self.chat_for_session_mut(session_id) {
                     chat.record_usage(
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_write_tokens,
+                        usage.input,
+                        usage.output,
+                        usage.cache_read,
+                        usage.cache_write,
                         cost,
                     );
                 }
@@ -10976,7 +11392,36 @@ impl App {
             .prefs_dao
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("preferences unavailable"))?;
-        crate::remote_mcp::remote_toggle_mcp_server(prefs, &mut self.mcp, name)
+        let servers = crate::remote_mcp::remote_toggle_mcp_server(prefs, &mut self.mcp, name)?;
+        let enabled = self
+            .mcp
+            .get(name)
+            .map(|server| server.enabled())
+            .unwrap_or(false);
+        if let Some(manager) = self.mcp_manager.clone() {
+            let name = name.to_string();
+            if enabled {
+                tokio::spawn(async move {
+                    let mut manager = manager.lock().await;
+                    let _ = manager.set_enabled(&name, true).await;
+                });
+            } else {
+                let dropped = manager
+                    .try_lock()
+                    .map(|mut guard| {
+                        guard.disable_sync(&name);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !dropped {
+                    tokio::spawn(async move {
+                        manager.lock().await.disable_sync(&name);
+                    });
+                }
+            }
+        }
+        self.refresh_mcp_summary();
+        Ok(servers)
     }
 
     pub fn remote_queued_message_previews(&self) -> Vec<String> {
@@ -11566,6 +12011,7 @@ impl App {
         let status_cwd = self.active_workspace_path();
         let branch = self.current_git_branch(&status_cwd);
         let reasoning_effort = self.active_reasoning_effort_label();
+        let reasoning_effort_explicit = self.active_reasoning_effort_explicit();
         self.refresh_mcp_summary();
         let mcp_summary = self.mcp_summary;
         let model_name = self.model_name_for_display(&self.provider_name, &self.model);
@@ -11574,6 +12020,8 @@ impl App {
 
         match self.base_focus {
             BaseFocus::Home => {
+                // Clone: render_home takes &mut self.input below.
+                let btw_entry = self.current_btw_entry().cloned();
                 render_home(
                     f,
                     &mut self.input,
@@ -11585,9 +12033,17 @@ impl App {
                     model_name,
                     provider_name,
                     reasoning_effort.clone(),
+                    reasoning_effort_explicit,
                     mcp_summary,
                     &colors,
                     usage_text,
+                    btw_entry.as_ref(),
+                    self.btw_scroll,
+                    &mut self.btw_panel_area,
+                    matches!(
+                        self.overlay_focus,
+                        OverlayFocus::None | OverlayFocus::SuggestionsPopup
+                    ),
                 );
 
                 if is_suggestions_visible(&self.suggestions_popup_state)
@@ -11611,6 +12067,7 @@ impl App {
                 let (display_agent, display_model) = self.current_session_agent_model_for_display();
                 let display_model_name =
                     self.model_name_for_display(&self.provider_name, &display_model);
+                let display_provider_name = self.provider_name_for_display(&self.provider_name);
                 let retry_status = self.current_session_retry_status();
                 let below_chat = self.dialog_below_chat_height(size);
                 let scroll_padding = if self.overlay_focus == OverlayFocus::QuestionDialog
@@ -11632,6 +12089,9 @@ impl App {
                 let is_streaming = self.is_streaming;
                 let is_compacting = self.compaction_receiver.is_some();
                 let esc_cancel_primed = is_streaming && self.esc_is_primed();
+                // Clone: render_chat takes &mut self fields below, and the panel
+                // must never alias the main chat messages anyway.
+                let btw_entry = self.current_btw_entry().cloned();
                 render_chat(
                     f,
                     &mut self.chat_state,
@@ -11642,8 +12102,9 @@ impl App {
                     display_agent,
                     display_model,
                     display_model_name,
-                    self.provider_name.clone(),
+                    display_provider_name,
                     reasoning_effort,
+                    reasoning_effort_explicit,
                     &colors,
                     is_streaming,
                     is_compacting,
@@ -11652,8 +12113,14 @@ impl App {
                     usage_text,
                     subagent_tabs,
                     &queued_messages,
+                    btw_entry.as_ref(),
+                    self.btw_scroll,
+                    &mut self.btw_panel_area,
                     &mut self.find_bar,
-                    self.overlay_focus == OverlayFocus::None,
+                    matches!(
+                        self.overlay_focus,
+                        OverlayFocus::None | OverlayFocus::SuggestionsPopup
+                    ),
                     self.session_manager
                         .get_current_session()
                         .map(|s| s.title.as_str()),
@@ -11688,12 +12155,14 @@ impl App {
             && self.models_dialog_state.dialog.is_visible()
         {
             let reasoning_effort = self.selected_model_reasoning_control_label();
+            let reasoning_effort_explicit = self.selected_model_reasoning_effort_explicit();
             render_models_dialog(
                 f,
                 &mut self.models_dialog_state,
                 size,
                 colors,
                 reasoning_effort.as_deref(),
+                reasoning_effort_explicit,
             );
         }
 
@@ -12336,6 +12805,10 @@ mod tests {
             models_receiver: None,
             models_dialog_provider_ids: None,
             title_generation_receiver: None,
+            btw_receiver: None,
+            btw_entries: Vec::new(),
+            btw_scroll: 0,
+            btw_panel_area: None,
             prefs_dao: None,
             agent: "Build".to_string(),
             agent_registry: crate::agent::definition::AgentRegistry::default(),
@@ -15338,6 +15811,25 @@ mod tests {
     }
 
     #[test]
+    fn session_usage_text_uses_stored_usage_cost() {
+        let mut app = test_app();
+        let mut message = crate::session::types::Message::assistant("done");
+        message.token_count = Some(1_000);
+        message
+            .parts
+            .push(crate::session::types::MessagePart::usage(
+                1_000_000, 0, 0, 0, 1.25,
+            ));
+        app.chat_state.chat.add_message(message);
+
+        assert!(
+            app.session_usage_text().contains("$1.25"),
+            "footer should show stored usage cost, got {}",
+            app.session_usage_text()
+        );
+    }
+
+    #[test]
     fn streaming_usage_base_caches_completed_messages_and_tracks_appends() {
         let mut app = test_app();
         app.chat_state
@@ -15532,6 +16024,119 @@ mod tests {
     }
 
     #[test]
+    fn btw_panel_tracks_current_session_and_closes() {
+        // Isolate XDG_STATE_HOME: create_new_session persists via HistoryDAO.
+        let _state = crate::jobs::test_env::TempState::new();
+        let mut app = test_app();
+        app.create_new_session(Some("btw session".to_string()));
+        assert!(app.current_btw_entry().is_none());
+
+        let session_id = app
+            .session_manager
+            .get_current_session_id()
+            .cloned()
+            .expect("session");
+        app.btw_entries.push(BtwEntry::pending(
+            Some(session_id.clone()),
+            "also check error handling".to_string(),
+        ));
+        assert_eq!(
+            app.current_btw_entry().map(|entry| entry.question.as_str()),
+            Some("also check error handling")
+        );
+
+        // Late reply fills the pending entry without touching main chat.
+        let chat_len = app.chat_state.chat.messages.len();
+        app.btw_receiver = None;
+        app.btw_entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.session_id == Some(session_id.clone()) && entry.is_pending())
+            .expect("pending btw")
+            .answer = Some("looks fine".to_string());
+        assert_eq!(app.chat_state.chat.messages.len(), chat_len);
+
+        assert!(app.dismiss_btw_panel());
+        assert!(app.current_btw_entry().is_none());
+        assert!(!app.dismiss_btw_panel());
+    }
+
+    #[test]
+    fn btw_panel_scrolls_with_mouse_wheel_and_clamps() {
+        let mut app = test_app();
+        let mut entry = BtwEntry::pending(None, "long answer".to_string());
+        entry.answer = Some(
+            (1..=30)
+                .map(|n| format!("para {n}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        app.btw_entries.push(entry);
+        // Pretend the panel was rendered above the input at full height.
+        app.btw_panel_area = Some(ratatui::layout::Rect::new(0, 10, 80, 13));
+
+        let colors = app.get_current_theme_colors();
+        let max = app.btw_scroll_max(&colors);
+        assert!(max > 0);
+
+        assert!(app.handle_btw_mouse_scroll(mouse(MouseEventKind::ScrollDown, 40, 12), 1));
+        assert_eq!(app.btw_scroll, 3.min(max));
+        // Outside the panel → not consumed, offset untouched.
+        assert!(!app.handle_btw_mouse_scroll(mouse(MouseEventKind::ScrollDown, 40, 2), 1));
+        assert_eq!(app.btw_scroll, 3.min(max));
+        // Scrolling far down clamps at max.
+        assert!(app.handle_btw_mouse_scroll(mouse(MouseEventKind::ScrollDown, 40, 12), 100));
+        assert_eq!(app.btw_scroll, max);
+        // Scroll back up clamps at the top.
+        assert!(app.handle_btw_mouse_scroll(mouse(MouseEventKind::ScrollUp, 40, 12), 100));
+        assert_eq!(app.btw_scroll, 0);
+    }
+
+    #[test]
+    fn btw_scroll_clamp_matches_short_panel_render() {
+        let mut app = test_app();
+        let mut entry = BtwEntry::pending(None, "long answer".to_string());
+        entry.answer = Some(
+            (1..=17)
+                .map(|n| format!("para {n}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        app.btw_entries.push(entry);
+        // Shrunken panel: only 5 body lines actually visible.
+        app.btw_panel_area = Some(ratatui::layout::Rect::new(0, 18, 80, 8));
+
+        let colors = app.get_current_theme_colors();
+        let total = crate::views::chat::btw_body_lines(
+            app.current_btw_entry().expect("entry"),
+            crate::views::chat::btw_body_width(80),
+            &colors,
+        )
+        .len();
+        // 17 paragraphs render with blank separators: 17 + 16 = 33 lines.
+        assert_eq!(total, 33);
+        // 33 - 5 visible = 28, so the last line is always reachable.
+        assert_eq!(app.btw_scroll_max(&colors), 28);
+    }
+
+    #[test]
+    fn btw_panel_works_on_home_without_session() {
+        let mut app = test_app();
+        assert!(app.session_manager.get_current_session_id().is_none());
+        assert!(app.current_btw_entry().is_none());
+
+        app.btw_entries
+            .push(BtwEntry::pending(None, "what is crabcode?".to_string()));
+        assert_eq!(
+            app.current_btw_entry().map(|entry| entry.question.as_str()),
+            Some("what is crabcode?")
+        );
+
+        assert!(app.dismiss_btw_panel());
+        assert!(app.current_btw_entry().is_none());
+    }
+
+    #[test]
     fn ctrl_n_is_not_a_global_new_session_shortcut() {
         let mut app = test_app();
         app.create_new_session(Some("Existing".to_string()));
@@ -15685,13 +16290,11 @@ mod tests {
         assert!(app.switch_to_session(&deleted_id));
 
         app.handle_keys(KeyEvent::new(
-            KeyCode::Char('d'),
+            KeyCode::Char('o'),
             event::KeyModifiers::CONTROL,
         ));
-        app.handle_keys(KeyEvent::new(
-            KeyCode::Char('d'),
-            event::KeyModifiers::CONTROL,
-        ));
+        app.handle_keys(KeyEvent::new(KeyCode::Char('d'), event::KeyModifiers::NONE));
+        app.handle_keys(KeyEvent::new(KeyCode::Enter, event::KeyModifiers::NONE));
 
         assert_eq!(app.overlay_focus, OverlayFocus::SessionsDialog);
         assert!(app.sessions_dialog_state.dialog.is_visible());
@@ -15714,13 +16317,11 @@ mod tests {
         app.open_sessions_dialog();
 
         app.handle_keys(KeyEvent::new(
-            KeyCode::Char('d'),
+            KeyCode::Char('o'),
             event::KeyModifiers::CONTROL,
         ));
-        app.handle_keys(KeyEvent::new(
-            KeyCode::Char('d'),
-            event::KeyModifiers::CONTROL,
-        ));
+        app.handle_keys(KeyEvent::new(KeyCode::Char('d'), event::KeyModifiers::NONE));
+        app.handle_keys(KeyEvent::new(KeyCode::Enter, event::KeyModifiers::NONE));
 
         assert_eq!(app.overlay_focus, OverlayFocus::SessionsDialog);
         assert!(app.sessions_dialog_state.dialog.is_visible());
@@ -15749,9 +16350,10 @@ mod tests {
         assert!(app.switch_to_session(&archived_id));
 
         app.handle_keys(KeyEvent::new(
-            KeyCode::Char('a'),
+            KeyCode::Char('o'),
             event::KeyModifiers::CONTROL,
         ));
+        app.handle_keys(KeyEvent::new(KeyCode::Char('a'), event::KeyModifiers::NONE));
 
         assert_eq!(app.overlay_focus, OverlayFocus::SessionsDialog);
         assert!(app.sessions_dialog_state.dialog.is_visible());

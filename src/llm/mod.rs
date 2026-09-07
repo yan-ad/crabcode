@@ -17,7 +17,7 @@ pub enum ChunkMessage {
         reasoning: String,
     },
     Warning(String),
-    Usage(crate::aisdk::chunk::LanguageModelUsage),
+    Usage(crate::aisdk::chunk::TokenUsage),
     ToolCalls(Vec<ToolCall>),
     ToolResult(ToolCallResult),
     SubagentStarted {

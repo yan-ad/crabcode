@@ -7,6 +7,7 @@ mod app;
 mod auth;
 mod autocomplete;
 mod command;
+mod completion;
 mod config;
 mod herdr;
 mod jobs;
@@ -72,7 +73,7 @@ use crate::toast::{Toast, ToastManager};
 use anyhow::{Context, Result};
 use app::App;
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, shells};
+use clap_complete::Shell;
 use ratatui::crossterm::{
     event::{
         self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -701,7 +702,7 @@ pub fn get_toast_manager() -> &'static Mutex<ToastManager> {
     about,
     long_about = None
 )]
-struct Args {
+pub(crate) struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -762,8 +763,15 @@ enum Command {
         cwd: Option<PathBuf>,
     },
 
-    /// Generate shell completion script
-    Completion,
+    /// Generate or install shell completions
+    Completion {
+        /// Target shell. Defaults from `$SHELL`.
+        #[arg(value_enum)]
+        shell: Option<Shell>,
+        /// Write the script where the shell autoloads it
+        #[arg(long)]
+        install: bool,
+    },
 
     /// Host the current workspace for browser and CLI clients
     Serve {
@@ -924,35 +932,11 @@ enum MaintenanceCommand {
     List,
 }
 
-fn is_completion_help(args: &[String]) -> bool {
-    matches!(args, [command, help] if command == "completion" && matches!(help.as_str(), "--help" | "-h"))
-}
-
-fn completion_shell(shell: Option<&str>) -> shells::Shell {
-    match shell.and_then(|shell| shell.rsplit('/').next()) {
-        Some("zsh") => shells::Shell::Zsh,
-        _ => shells::Shell::Bash,
-    }
-}
-
-fn generate_completion(shell: shells::Shell) -> Vec<u8> {
-    let mut command = Args::command();
-    let mut output = Vec::new();
-    generate(shell, &mut command, "crabcode", &mut output);
-    output
-}
-
 fn root_help() -> Result<String> {
     let mut command = Args::command();
     let mut output = Vec::new();
     command.write_long_help(&mut output)?;
     Ok(String::from_utf8(output).expect("Clap help is valid UTF-8"))
-}
-
-fn print_completion() -> Result<()> {
-    let shell = completion_shell(std::env::var("SHELL").ok().as_deref());
-    io::stdout().write_all(&generate_completion(shell))?;
-    Ok(())
 }
 
 fn merge_prompt_with_stdin(prompt: &str, stdin: &str) -> String {
@@ -1003,12 +987,6 @@ fn launch_remote_serve(request: app::RemoteLaunchRequest) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if is_completion_help(&raw_args) {
-        println!("{}", root_help()?);
-        return Ok(());
-    }
-
     let args = Args::parse();
     crate::logging::set_enabled(args.emit_logs);
     crate::aisdk::log::set_logger(|msg| {
@@ -1039,8 +1017,11 @@ async fn main() -> Result<()> {
         Some(Command::Acp { cwd }) => {
             return crate::acp::run(cwd.clone()).await;
         }
-        Some(Command::Completion) => {
-            print_completion()?;
+        Some(Command::Completion { shell, install }) => {
+            crate::completion::run(
+                shell.unwrap_or_else(crate::completion::default_shell),
+                *install,
+            )?;
             return Ok(());
         }
         Some(Command::Serve { bind, pair_code }) => {
@@ -1438,7 +1419,6 @@ mod tests {
             "",
         ])
         .unwrap();
-
         match args.command {
             Some(Command::Stats {
                 days,
@@ -1466,9 +1446,7 @@ mod tests {
 
     #[test]
     fn generates_bash_completion() {
-        let script =
-            String::from_utf8(generate_completion(completion_shell(Some("/bin/bash")))).unwrap();
-
+        let script = String::from_utf8(crate::completion::generate_script(Shell::Bash)).unwrap();
         assert!(script.contains("_crabcode"));
         assert!(script.contains("complete"));
         assert!(script.contains("crabcode"));
@@ -1476,33 +1454,43 @@ mod tests {
 
     #[test]
     fn generates_zsh_completion() {
-        let script =
-            String::from_utf8(generate_completion(completion_shell(Some("/bin/zsh")))).unwrap();
-
+        let script = String::from_utf8(crate::completion::generate_script(Shell::Zsh)).unwrap();
         assert!(script.starts_with("#compdef crabcode"));
         assert!(script.contains("_crabcode"));
     }
 
     #[test]
-    fn completion_help_uses_root_help() {
-        assert!(is_completion_help(&[
-            "completion".to_string(),
-            "--help".to_string()
-        ]));
-        assert!(is_completion_help(&[
-            "completion".to_string(),
-            "-h".to_string()
-        ]));
-        assert!(!is_completion_help(&["completion".to_string()]));
-        assert!(!is_completion_help(&[
-            "serve".to_string(),
-            "--help".to_string()
-        ]));
+    fn parses_completion_shell_and_install() {
+        let args = Args::try_parse_from(["crabcode", "completion", "zsh", "--install"]).unwrap();
+        match args.command {
+            Some(Command::Completion { shell, install }) => {
+                assert_eq!(shell, Some(Shell::Zsh));
+                assert!(install);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
 
+    #[test]
+    fn parses_completion_without_shell() {
+        let args = Args::try_parse_from(["crabcode", "completion"]).unwrap();
+        match args.command {
+            Some(Command::Completion { shell, install }) => {
+                assert_eq!(shell, None);
+                assert!(!install);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_help_lists_completion() {
         let help = root_help().unwrap();
         assert!(help.contains("Usage: crabcode"));
-        assert!(help.contains("completion   Generate shell completion script"));
-        assert!(help.contains("stats        Show token usage and cost statistics"));
+        assert!(help.contains("completion"));
+        assert!(help.contains("Generate or install shell completions"));
+        assert!(help.contains("stats"));
+        assert!(help.contains("Show token usage and cost statistics"));
         assert!(
             help.contains("serve        Host the current workspace for browser and CLI clients")
         );
@@ -1689,6 +1677,19 @@ async fn run_event_loop(
             if std::env::var_os("CRABCODE_MOUSE_TRACE").is_some() {
                 if let event::Event::Mouse(mouse) = &event {
                     crate::emit_log!("Mouse event: {:?}", mouse);
+                }
+            }
+
+            // Opt-in raw key trace: CRABCODE_KEY_TRACE=1 shows every key
+            // event as a toast (useful to see what a terminal actually
+            // sends for combos like Cmd+Shift+Left).
+            if std::env::var_os("CRABCODE_KEY_TRACE").is_some() {
+                if let event::Event::Key(key) = &event {
+                    push_toast(Toast::new(
+                        format!("Key: {:?}", key),
+                        crate::toast::ToastLevel::Info,
+                        None,
+                    ));
                 }
             }
 
