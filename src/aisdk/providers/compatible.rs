@@ -456,10 +456,9 @@ fn debug_log(msg: &str) {
 /// Looks for `prompt_tokens_details.cached_tokens` and Anthropic-style fields
 /// that some gateways forward.
 fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::TokenUsage> {
-    let prompt = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(|v| v.as_u64());
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+    let prompt = prompt_tokens.or(input_tokens);
     let completion = usage
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
@@ -516,8 +515,16 @@ fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::To
         hit_pct
     ));
 
+    // Chat Completions prompt_tokens and Responses-style input_tokens paired
+    // with cached_tokens include cache hits. Anthropic-shaped input_tokens is
+    // already non-cached and must not have cache_read subtracted again.
+    let non_cached_input = if prompt_tokens.is_some() || cached > 0 {
+        prompt_v.saturating_sub(effective_cached)
+    } else {
+        prompt_v
+    };
     Some(crate::chunk::TokenUsage {
-        input: prompt_v.saturating_sub(effective_cached),
+        input: non_cached_input,
         output: completion.unwrap_or(0),
         cache_read: effective_cached,
         cache_write: cache_creation,
@@ -641,6 +648,12 @@ fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
 
     match finish_reason {
         "" => {}
+        "length" => chunks.push(Ok(ChunkType::Incomplete(
+            "finish_reason=length".to_string(),
+        ))),
+        "content_filter" => chunks.push(Ok(ChunkType::Failed(
+            "finish_reason=content_filter".to_string(),
+        ))),
         _ => chunks.push(Ok(ChunkType::End {
             reason: Some(FinishReason::from_openai_compatible(finish_reason)),
         })),
@@ -683,6 +696,19 @@ mod tests {
     }
 
     #[test]
+    fn request_asks_streaming_gateways_for_token_usage() {
+        let body = openai_compatible_request_body(
+            "gpt-test",
+            vec![serde_json::json!({
+                "role": "user",
+                "content": "hi",
+            })],
+        );
+
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn serializes_audio_input_content_part() {
         let user = crate::message::UserMessage {
             content: "Describe this".to_string(),
@@ -704,16 +730,19 @@ mod tests {
     }
 
     #[test]
-    fn request_asks_streaming_gateways_for_token_usage() {
-        let body = openai_compatible_request_body(
-            "gpt-test",
-            vec![serde_json::json!({
-                "role": "user",
-                "content": "hi",
-            })],
+    fn responses_style_usage_aliases_are_normalized() {
+        let chunks = process_sse_data(
+            r#"{"choices":[],"usage":{"input_tokens":120,"output_tokens":30,"cached_tokens":80,"cache_write_input_tokens":10}}"#,
         );
-
-        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(matches!(
+            chunks.as_slice(),
+            [Ok(ChunkType::Usage(crate::chunk::TokenUsage {
+                input: 40,
+                output: 30,
+                cache_read: 80,
+                cache_write: 10,
+            }))]
+        ));
     }
 
     #[test]

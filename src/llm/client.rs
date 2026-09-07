@@ -77,22 +77,14 @@ fn model_supports_audio_input(model: Option<&crate::model::discovery::Model>) ->
 }
 
 fn usage_cost(
-    usage: crate::aisdk::chunk::LanguageModelUsage,
+    usage: crate::aisdk::chunk::TokenUsage,
     pricing: Option<&crate::model::discovery::Cost>,
 ) -> Option<f64> {
     let pricing = pricing?;
-    let cached = usage.cache_read_tokens.min(usage.input_tokens);
-    let written = usage
-        .cache_write_tokens
-        .min(usage.input_tokens.saturating_sub(cached));
-    let uncached = usage
-        .input_tokens
-        .saturating_sub(cached)
-        .saturating_sub(written);
-    let input_cost = uncached as f64 * pricing.input;
-    let cache_read_cost = cached as f64 * pricing.cache_read.unwrap_or(pricing.input);
-    let cache_write_cost = written as f64 * pricing.cache_write.unwrap_or(pricing.input);
-    let output_cost = usage.output_tokens as f64 * pricing.output;
+    let input_cost = usage.input as f64 * pricing.input;
+    let cache_read_cost = usage.cache_read as f64 * pricing.cache_read.unwrap_or(pricing.input);
+    let cache_write_cost = usage.cache_write as f64 * pricing.cache_write.unwrap_or(pricing.input);
+    let output_cost = usage.output as f64 * pricing.output;
     Some((input_cost + cache_read_cost + cache_write_cost + output_cost) / 1_000_000.0)
 }
 
@@ -628,7 +620,7 @@ fn truncate_log_value(value: &str, max_chars: usize) -> String {
 struct StreamRelayResult {
     outcome: StreamRelayOutcome,
     stats: RelayStats,
-    usage: Option<crate::aisdk::chunk::LanguageModelUsage>,
+    usage: Option<crate::aisdk::chunk::TokenUsage>,
 }
 
 pub async fn stream_llm_with_cancellation(
@@ -2094,7 +2086,7 @@ async fn relay_stream_to_sender(
     context: StreamLogContext<'_>,
     mut mismatch_warning: Option<String>,
     pricing: Option<&crate::model::discovery::Cost>,
-    base_usage: Option<crate::aisdk::chunk::LanguageModelUsage>,
+    base_usage: Option<crate::aisdk::chunk::TokenUsage>,
 ) -> Result<StreamRelayResult, DynError> {
     let mut stats = RelayStats::default();
     let mut stream_usage = None;
@@ -2249,16 +2241,7 @@ async fn relay_stream_to_sender(
             ChunkType::Usage(usage) => {
                 let elapsed_ms = start_time.elapsed().as_millis();
                 stats.record_chunk("Usage", elapsed_ms);
-                let normalized_usage = crate::aisdk::chunk::LanguageModelUsage {
-                    input_tokens: usage
-                        .input
-                        .saturating_add(usage.cache_read)
-                        .saturating_add(usage.cache_write),
-                    output_tokens: usage.output,
-                    cache_read_tokens: usage.cache_read,
-                    cache_write_tokens: usage.cache_write,
-                };
-                stream_usage = combined_usage(stream_usage, Some(normalized_usage));
+                stream_usage = Some(stream_usage.unwrap_or_default().saturating_add(usage));
                 crate::emit_log!(
                     "[RELAY] Usage input={} output={} cache_read={} cache_write={}",
                     usage.input,
@@ -2366,16 +2349,13 @@ async fn relay_stream_to_sender(
 }
 
 fn combined_usage(
-    base: Option<crate::aisdk::chunk::LanguageModelUsage>,
-    current: Option<crate::aisdk::chunk::LanguageModelUsage>,
-) -> Option<crate::aisdk::chunk::LanguageModelUsage> {
+    base: Option<crate::aisdk::chunk::TokenUsage>,
+    current: Option<crate::aisdk::chunk::TokenUsage>,
+) -> Option<crate::aisdk::chunk::TokenUsage> {
     match (base, current) {
         (None, None) => None,
         (Some(usage), None) | (None, Some(usage)) => Some(usage),
-        (Some(mut base), Some(current)) => {
-            base += current;
-            Some(base)
-        }
+        (Some(base), Some(current)) => Some(base.saturating_add(current)),
     }
 }
 
@@ -4249,11 +4229,11 @@ fn maps_runtime_stop_reasons_to_turn_events() {
 
 #[test]
 fn computes_cache_aware_usage_cost() {
-    let usage = crate::aisdk::chunk::LanguageModelUsage {
-        input_tokens: 1_000_000,
-        output_tokens: 100_000,
-        cache_read_tokens: 600_000,
-        cache_write_tokens: 100_000,
+    let usage = crate::aisdk::chunk::TokenUsage {
+        input: 300_000,
+        output: 100_000,
+        cache_read: 600_000,
+        cache_write: 100_000,
     };
     let pricing = crate::model::discovery::Cost {
         input: 2.0,

@@ -413,7 +413,9 @@ pub fn message_context_tokens(message: &Message) -> usize {
     // Billed compaction usage can be persisted on the summary. Context is the
     // summary text, never those billed prompt tokens.
     if is_compaction_summary(message) {
-        return estimate_tokens(&message.content);
+        return message
+            .token_count
+            .unwrap_or_else(|| estimate_tokens(&message.content));
     }
 
     let part_tokens = message_parts_context_tokens(message);

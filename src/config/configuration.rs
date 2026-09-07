@@ -4,7 +4,7 @@ use crate::tools::{
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -205,15 +205,15 @@ fn parse_provider_id_set(
     value: Option<&Value>,
     diagnostics: &mut ConfigDiagnostics,
     key: &str,
-) -> HashSet<String> {
+) -> BTreeSet<String> {
     let Some(value) = value else {
-        return HashSet::new();
+        return BTreeSet::new();
     };
     let Some(entries) = value.as_array() else {
         diagnostics
             .warnings
             .push(format!("{key} must be an array of provider IDs"));
-        return HashSet::new();
+        return BTreeSet::new();
     };
 
     entries
@@ -621,8 +621,8 @@ pub struct MergedConfig {
     pub agent_permission_rules: HashMap<String, PermissionRules>,
     pub agent_steps: HashMap<String, usize>,
     pub provider_timeouts: HashMap<String, ProviderTimeout>,
-    pub disabled_providers: BTreeSet<String>,
     pub enabled_providers: BTreeSet<String>,
+    pub disabled_providers: BTreeSet<String>,
     pub custom_providers: HashMap<String, CustomProviderConfig>,
     pub notifications: NotificationsConfig,
     pub images: ImagesConfig,
@@ -1605,16 +1605,12 @@ fn parse_merged_config(merged: &Value, diagnostics: &mut ConfigDiagnostics) -> M
     out.sync_agent_derived_fields();
     out.plugins = parse_plugin_specs(obj.get("plugin"), diagnostics);
     out.provider_timeouts = parse_provider_timeouts(obj.get("provider"), diagnostics);
-    let enabled_providers = obj
-        .get("enabled_providers")
-        .or_else(|| obj.get("enabledProviders"));
-    out.enabled_providers = enabled_providers
-        .map(|value| {
-            parse_provider_id_set(Some(value), diagnostics, "enabled_providers")
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
+    out.enabled_providers = parse_provider_id_set(
+        obj.get("enabled_providers")
+            .or_else(|| obj.get("enabledProviders")),
+        diagnostics,
+        "enabled_providers",
+    );
     out.disabled_providers = parse_provider_id_set(
         obj.get("disabled_providers")
             .or_else(|| obj.get("disabledProviders")),

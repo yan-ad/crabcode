@@ -266,17 +266,11 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn apply_usage(
-        &mut self,
-        usage: crate::aisdk::chunk::LanguageModelUsage,
-        cost: Option<f64>,
-    ) {
-        self.input_tokens = Some(usize::try_from(usage.input_tokens).unwrap_or(usize::MAX));
-        self.output_tokens = Some(usize::try_from(usage.output_tokens).unwrap_or(usize::MAX));
-        self.cache_read_tokens =
-            Some(usize::try_from(usage.cache_read_tokens).unwrap_or(usize::MAX));
-        self.cache_write_tokens =
-            Some(usize::try_from(usage.cache_write_tokens).unwrap_or(usize::MAX));
+    pub fn apply_usage(&mut self, usage: crate::aisdk::chunk::TokenUsage, cost: Option<f64>) {
+        self.input_tokens = Some(usize::try_from(usage.input).unwrap_or(usize::MAX));
+        self.output_tokens = Some(usize::try_from(usage.output).unwrap_or(usize::MAX));
+        self.cache_read_tokens = Some(usize::try_from(usage.cache_read).unwrap_or(usize::MAX));
+        self.cache_write_tokens = Some(usize::try_from(usage.cache_write).unwrap_or(usize::MAX));
         self.cost = cost;
         self.usage_authoritative = true;
     }

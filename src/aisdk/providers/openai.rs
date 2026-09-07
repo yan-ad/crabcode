@@ -35,14 +35,6 @@ const OPENAI_WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_secs(300);
 const OPENAI_WEBSOCKET_STREAM_RETRIES: usize = 1;
 const OPENAI_WEBSOCKET_FAILURES_BEFORE_FALLBACK: usize = 5;
 
-#[async_trait]
-pub trait HttpResponseRetryPolicy: Send + Sync + std::fmt::Debug {
-    async fn retry_headers(
-        &self,
-        status: reqwest::StatusCode,
-    ) -> Option<reqwest::header::HeaderMap>;
-}
-
 fn responses_incomplete_chunk(value: &serde_json::Value) -> ChunkType {
     let reason = value
         .get("response")
@@ -60,6 +52,14 @@ fn responses_incomplete_chunk(value: &serde_json::Value) -> ChunkType {
             value,
         ))),
     }
+}
+
+#[async_trait]
+pub trait HttpResponseRetryPolicy: Send + Sync + std::fmt::Debug {
+    async fn retry_headers(
+        &self,
+        status: reqwest::StatusCode,
+    ) -> Option<reqwest::header::HeaderMap>;
 }
 
 #[derive(Debug, Clone)]
@@ -2643,6 +2643,37 @@ mod tests {
             }
             other => panic!("expected ResponseCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn response_incomplete_safety_reasons_emit_refusal() {
+        for reason in ["refusal", "content_filter", "safety"] {
+            let chunk = response_sse_data_to_chunk(&format!(
+                r#"{{"type":"response.incomplete","response":{{"incomplete_details":{{"reason":"{reason}"}}}}}}"#
+            ))
+            .expect("expected incomplete chunk");
+            assert!(matches!(
+                chunk,
+                Ok(ChunkType::End {
+                    reason: Some(crate::chunk::FinishReason::Refusal)
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn response_incomplete_max_output_tokens_emits_terminal_reason() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .expect("expected incomplete chunk");
+
+        assert!(matches!(
+            chunk,
+            Ok(ChunkType::End {
+                reason: Some(crate::chunk::FinishReason::Length)
+            })
+        ));
     }
 
     #[test]

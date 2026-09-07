@@ -63,13 +63,18 @@ mod usage_tests {
             cache_write_tokens: Some(10),
             cost: Some(0.0125),
             usage_authoritative: true,
-            tokens_per_sec: Some(25.0),
+            tokens_per_sec: Some(50.0),
         };
 
         dao.add_message(&message).unwrap();
         let restored = dao.get_messages(session_id).unwrap();
         assert_eq!(restored[0].input_tokens, Some(100));
+        assert_eq!(restored[0].output_tokens, Some(25));
+        assert_eq!(restored[0].cache_read_tokens, Some(60));
+        assert_eq!(restored[0].cache_write_tokens, Some(10));
         assert_eq!(restored[0].cost, Some(0.0125));
+        assert!(restored[0].usage_authoritative);
+        assert_eq!(restored[0].tokens_per_sec, Some(50.0));
         let session = dao.get_session(session_id).unwrap().unwrap();
         assert_eq!(session.total_tokens, 125);
         assert!((session.total_cost - 0.0125).abs() < f64::EPSILON);
@@ -674,7 +679,7 @@ impl HistoryDAO {
                 cache_write_tokens: row.get(16)?,
                 cost: row.get(17)?,
                 usage_authoritative: row.get(18)?,
-                tokens_per_sec: row.get(19).unwrap_or(None),
+                tokens_per_sec: row.get(19)?,
             })
         })?;
 

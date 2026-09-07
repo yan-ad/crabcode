@@ -1937,7 +1937,7 @@ impl Chat {
 
     pub fn apply_streaming_usage(
         &mut self,
-        usage: crate::aisdk::chunk::LanguageModelUsage,
+        usage: crate::aisdk::chunk::TokenUsage,
         cost: Option<f64>,
         duration_ms: u64,
     ) {
@@ -1946,7 +1946,14 @@ impl Chat {
             .iter_mut()
             .rfind(|message| message.role == MessageRole::Assistant)
         {
-            message.apply_usage(usage, cost);
+            message.input_tokens = Some(usize::try_from(usage.input).unwrap_or(usize::MAX));
+            message.output_tokens = Some(usize::try_from(usage.output).unwrap_or(usize::MAX));
+            message.cache_read_tokens =
+                Some(usize::try_from(usage.cache_read).unwrap_or(usize::MAX));
+            message.cache_write_tokens =
+                Some(usize::try_from(usage.cache_write).unwrap_or(usize::MAX));
+            message.cost = cost;
+            message.usage_authoritative = true;
             message.duration_ms = Some(duration_ms);
         }
     }
@@ -2697,10 +2704,10 @@ impl Chat {
                 upstream_tokens_per_sec(billed_output, decode_duration_ms).or(sample_tps);
             self.cached_tokens_per_sec = final_tps;
             if let Some(msg) = self.messages.get_mut(idx) {
-                if !msg.usage_authoritative && msg.output_tokens.is_none() {
-                    msg.output_tokens = Some(token_count);
+                if !msg.usage_authoritative {
+                    msg.output_tokens = Some(msg.output_tokens.unwrap_or(token_count));
                 }
-                msg.token_count = msg.output_tokens.or(Some(token_count));
+                msg.token_count = msg.output_tokens;
                 msg.duration_ms = Some(decode_duration_ms);
                 msg.tokens_per_sec = final_tps;
                 msg.finish_reasoning_timer(finalized_at);

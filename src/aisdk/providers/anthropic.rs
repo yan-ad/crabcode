@@ -962,7 +962,30 @@ mod tests {
             .expect("event should produce a chunk")
             .expect("chunk should parse");
 
-        assert!(matches!(chunk, ChunkType::Incomplete(_)));
+        assert!(matches!(
+            chunk,
+            ChunkType::End {
+                reason: Some(FinishReason::Length)
+            }
+        ));
+    }
+
+    #[test]
+    fn refusal_stop_reason_emits_terminal_reason() {
+        let value = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "refusal" },
+        });
+        let chunk = anthropic_stream_chunk("message_delta", &value)
+            .expect("event should produce a chunk")
+            .expect("chunk should parse");
+
+        assert!(matches!(
+            chunk,
+            ChunkType::End {
+                reason: Some(FinishReason::Refusal)
+            }
+        ));
     }
 
     #[test]
@@ -1048,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn max_tokens_delta_emits_final_usage_then_incomplete() {
+    fn max_tokens_delta_emits_final_usage_then_terminal_reason() {
         let value = serde_json::json!({
             "type": "message_delta",
             "delta": {
@@ -1073,7 +1096,9 @@ mod tests {
                     cache_read: 5,
                     cache_write: 2,
                 })),
-                Ok(ChunkType::Incomplete(_)),
+                Ok(ChunkType::End {
+                    reason: Some(FinishReason::Length)
+                }),
             ]
         ));
     }

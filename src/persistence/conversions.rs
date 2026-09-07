@@ -339,14 +339,15 @@ mod tests {
     fn authoritative_usage_round_trips_through_persistence() {
         let mut session_message = SessionMessage::assistant("hello");
         session_message.apply_usage(
-            crate::aisdk::chunk::LanguageModelUsage {
-                input_tokens: 100,
-                output_tokens: 25,
-                cache_read_tokens: 60,
-                cache_write_tokens: 10,
+            crate::aisdk::chunk::TokenUsage {
+                input: 100,
+                output: 25,
+                cache_read: 60,
+                cache_write: 10,
             },
             Some(0.0125),
         );
+        session_message.tokens_per_sec = Some(80.0);
 
         let restored = SessionMessage::try_from(Message::from(session_message)).unwrap();
         assert_eq!(restored.input_tokens, Some(100));
@@ -355,6 +356,7 @@ mod tests {
         assert_eq!(restored.cache_write_tokens, Some(10));
         assert_eq!(restored.cost, Some(0.0125));
         assert!(restored.usage_authoritative);
+        assert_eq!(restored.tokens_per_sec, Some(80.0));
     }
 
     #[test]
