@@ -1,7 +1,9 @@
 use crate::agent::config::OpenAIRequestOptions;
 use crate::aisdk::core::{
     chunk::{ChunkType, MessagePhase},
-    response::{stream_with_tools, LanguageModelStream, StreamTextResponse},
+    response::{
+        stream_with_tools_options, LanguageModelStream, StreamTextResponse, StreamWithToolsOptions,
+    },
     stop::StopReason,
     Message as AisdkMessage, Tool,
 };
@@ -48,6 +50,7 @@ struct ProviderRequestConfig {
     openai_options: OpenAIRequestOptions,
     /// Vercel AI Gateway: enable `providerOptions.gateway.caching = "auto"`.
     gateway_caching_auto: bool,
+    prune_tool_outputs: bool,
 }
 
 fn messages_have_user_audio(messages: &[crate::session::types::Message]) -> bool {
@@ -119,6 +122,7 @@ impl ProviderRequestConfig {
             pricing: None,
             openai_options: OpenAIRequestOptions::default(),
             gateway_caching_auto: false,
+            prune_tool_outputs: false,
         }
     }
 }
@@ -635,6 +639,7 @@ pub async fn stream_llm_with_cancellation(
     tool_permissions: crate::tools::ToolPermissions,
     websearch_config: crate::config::configuration::WebsearchConfig,
     mcp_config: crate::config::configuration::McpConfig,
+    compaction_config: crate::config::configuration::CompactionConfig,
     workspace: String,
     tool_registry: Option<crate::tools::ToolRegistry>,
     messages: Vec<crate::session::types::Message>,
@@ -666,6 +671,7 @@ pub async fn stream_llm_with_cancellation(
     )
     .await?;
     let mut request_config = request_config;
+    request_config.prune_tool_outputs = compaction_config.prune();
     let model_mismatch_warning =
         ui_vs_request_model_mismatch_warning(&ui_model, &request_config.model_name);
     // Sticky prompt-cache routing: same key for every tool step in this session.
@@ -719,6 +725,7 @@ pub async fn stream_llm_with_cancellation(
         openai_options: request_config.openai_options.clone(),
         prompt_cache_key: Some(session_id.clone()),
         gateway_caching_auto: request_config.gateway_caching_auto,
+        prune_tool_outputs: request_config.prune_tool_outputs,
     };
     crate::agent::config::set_llm_session(llm_session.clone());
     let session_registration =
@@ -980,6 +987,7 @@ pub async fn build_subagent_llm_session(
         openai_options: request_config.openai_options,
         prompt_cache_key: None,
         gateway_caching_auto: request_config.gateway_caching_auto,
+        prune_tool_outputs: false,
     })
 }
 
@@ -1876,7 +1884,7 @@ async fn stream_provider_request(
                 builder = builder.prompt_cache_key(cache_key);
             }
             let provider = builder.build().map_err(|e| -> DynError { Box::new(e) })?;
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -1884,6 +1892,9 @@ async fn stream_provider_request(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: config.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| Box::new(e) as DynError)
@@ -1909,7 +1920,7 @@ async fn stream_provider_request(
                 }
             }
             let provider = builder.build().map_err(|e| -> DynError { Box::new(e) })?;
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -1917,6 +1928,9 @@ async fn stream_provider_request(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: config.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| Box::new(e) as DynError)
@@ -1969,7 +1983,7 @@ async fn stream_provider_request(
             }
 
             let provider = builder.build().map_err(|e| -> DynError { Box::new(e) })?;
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -1977,6 +1991,9 @@ async fn stream_provider_request(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: config.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| Box::new(e) as DynError)

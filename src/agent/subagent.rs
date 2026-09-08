@@ -381,7 +381,7 @@ async fn start_subagent_stream(
     extra_headers: std::collections::HashMap<String, String>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<crate::aisdk::core::response::StreamTextResponse, String> {
-    use crate::aisdk::core::response::stream_with_tools;
+    use crate::aisdk::core::response::{stream_with_tools_options, StreamWithToolsOptions};
     use crate::aisdk::{Anthropic, OpenAI, OpenAICompatible};
 
     let mut headers = crate::llm::opencode::ensure_session_headers(
@@ -417,7 +417,7 @@ async fn start_subagent_stream(
                 .build()
                 .map_err(|e| format!("Failed to build OpenAICompatible provider: {}", e))?;
 
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -425,6 +425,9 @@ async fn start_subagent_stream(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: session.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| format!("Stream error: {}", e))
@@ -442,7 +445,7 @@ async fn start_subagent_stream(
                 .build()
                 .map_err(|e| format!("Failed to build Anthropic provider: {}", e))?;
 
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -450,6 +453,9 @@ async fn start_subagent_stream(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: session.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| format!("Stream error: {}", e))
@@ -496,7 +502,7 @@ async fn start_subagent_stream(
                 .build()
                 .map_err(|e| format!("Failed to build OpenAI provider: {}", e))?;
 
-            stream_with_tools(
+            stream_with_tools_options(
                 provider,
                 messages,
                 tools,
@@ -504,6 +510,9 @@ async fn start_subagent_stream(
                 None,
                 headers,
                 cancel_token,
+                StreamWithToolsOptions {
+                    prune_tool_outputs: session.prune_tool_outputs,
+                },
             )
             .await
             .map_err(|e| format!("Stream error: {}", e))
@@ -545,14 +554,17 @@ async fn resolve_subagent_session(
 
     let (fallback_sender, _fallback_rx) = tokio::sync::mpsc::unbounded_channel();
     let sender = sender.unwrap_or(&fallback_sender);
-    crate::llm::client::build_subagent_llm_session(
+    let prune_tool_outputs = parent_session.prune_tool_outputs;
+    let mut session = crate::llm::client::build_subagent_llm_session(
         provider,
         model.to_string(),
         agent.reasoning_effort,
         sender,
     )
     .await
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    session.prune_tool_outputs = prune_tool_outputs;
+    Ok(session)
 }
 
 fn normalize_subagent_output(output: String) -> String {
@@ -604,6 +616,27 @@ mod tests {
 
         assert!(warnings.is_empty());
         assert_eq!(session.reasoning_effort, None);
+    }
+
+    #[test]
+    fn subagent_inherits_parent_pruning_policy() {
+        let mut warnings = Vec::new();
+        let agent = crate::agent::definition::parse_agent_definitions_from_config(
+            Some(&serde_json::json!({
+                "explore": { "mode": "subagent" }
+            })),
+            &mut warnings,
+        )
+        .pop()
+        .expect("agent definition");
+        let mut parent = test_session(None);
+        parent.prune_tool_outputs = true;
+
+        let session = tokio_test::block_on(resolve_subagent_session(&agent, parent, None))
+            .expect("resolved session");
+
+        assert!(warnings.is_empty());
+        assert!(session.prune_tool_outputs);
     }
 
     #[test]
@@ -717,6 +750,7 @@ mod tests {
             openai_options: crate::agent::config::OpenAIRequestOptions::default(),
             prompt_cache_key: None,
             gateway_caching_auto: false,
+            prune_tool_outputs: false,
         }
     }
 }
