@@ -317,7 +317,7 @@ impl OAuthProvider {
 
     fn default_model(self) -> &'static str {
         match self {
-            Self::OpenAI => "gpt-5.3-codex",
+            Self::OpenAI => "gpt-5.4",
             Self::XAI => "grok-build-0.1",
         }
     }
@@ -5114,6 +5114,10 @@ impl App {
             self.input.clear_hover();
         }
 
+        if self.handle_error_toast_mouse(mouse) {
+            return;
+        }
+
         if self.handle_selection_action_mouse(mouse) {
             return;
         }
@@ -6463,6 +6467,36 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn handle_error_toast_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let copied = {
+            let manager = get_toast_manager().lock().unwrap();
+            manager
+                .copyable_message_at(self.last_frame_size, Position::new(mouse.column, mouse.row))
+        };
+        let Some((message, level)) = copied else {
+            return false;
+        };
+
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            return false;
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.is_empty()
+        {
+            let confirmation = match level {
+                crate::toast::ToastLevel::Warning => "Copied warning to clipboard",
+                _ => "Copied error to clipboard",
+            };
+            self.copy_text_with_toast(&message, confirmation);
+        }
+
+        true
     }
 
     fn handle_copy_actions_event(&mut self, event: ActionDialogEvent) -> bool {
