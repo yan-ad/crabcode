@@ -50,7 +50,7 @@ pub struct OpenAI {
     model_name: String,
     provider_name: String,
     responses_path: String,
-    headers: HashMap<String, String>,
+    default_headers: HashMap<String, String>,
     store_override: Option<bool>,
     strip_system_and_developer_messages: bool,
     tool_strict_override: Option<bool>,
@@ -89,7 +89,7 @@ pub struct OpenAIBuilder {
     model_name: Option<String>,
     provider_name: Option<String>,
     responses_path: String,
-    headers: HashMap<String, String>,
+    default_headers: HashMap<String, String>,
     store_override: Option<bool>,
     strip_system_and_developer_messages: bool,
     tool_strict_override: Option<bool>,
@@ -128,8 +128,11 @@ impl OpenAIBuilder {
         self
     }
 
-    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
-        self.headers = headers;
+    /// Static headers set at build time (e.g. `User-Agent`, tenant routing).
+    /// Per-request `stream_text` headers win on conflict (`HeaderMap` is
+    /// case-insensitive, so applied second).
+    pub fn default_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.default_headers = headers;
         self
     }
 
@@ -191,7 +194,15 @@ impl OpenAIBuilder {
         let responses_path = {
             let trimmed = self.responses_path.trim();
             if trimmed.is_empty() {
-                "/v1/responses".to_string()
+                // Gateways often ship base URLs that already include a version
+                // segment (e.g. https://opencode.ai/zen/go/v1). Appending the
+                // default `/v1/responses` there produces a duplicated
+                // `/v1/v1/...` path that 404s.
+                if super::base_url_has_version_segment(base_url.trim_end_matches('/')) {
+                    "/responses".to_string()
+                } else {
+                    "/v1/responses".to_string()
+                }
             } else if trimmed.starts_with('/') {
                 trimmed.to_string()
             } else {
@@ -205,7 +216,7 @@ impl OpenAIBuilder {
             model_name,
             provider_name,
             responses_path,
-            headers: self.headers,
+            default_headers: self.default_headers,
             store_override: self.store_override,
             strip_system_and_developer_messages: self.strip_system_and_developer_messages,
             tool_strict_override: self.tool_strict_override,
@@ -356,22 +367,8 @@ impl Provider for OpenAI {
                 format!("Bearer {}", self.api_key).parse().unwrap(),
             );
         }
-        for (k, v) in &self.headers {
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                reqwest::header::HeaderValue::from_str(v),
-            ) {
-                request_headers.insert(name, value);
-            }
-        }
-        for (k, v) in headers {
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                reqwest::header::HeaderValue::from_str(v),
-            ) {
-                request_headers.insert(name, value);
-            }
-        }
+        super::apply_extra_headers(&mut request_headers, &self.default_headers);
+        super::apply_extra_headers(&mut request_headers, headers);
         add_responses_lite_header(&mut request_headers, self.responses_lite);
         if self.responses_lite {
             if let Some(session_id) = self
@@ -1545,26 +1542,20 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
                 return Some(Ok(responses_error_chunk(&value, event_type)));
             }
             let resp = &value["response"];
-            if let Some(usage) = resp.get("usage") {
-                log_openai_responses_usage(usage);
-            }
+            log_openai_responses_completed(resp);
             Some(Ok(ChunkType::ResponseCompleted {
                 end_turn: resp.get("end_turn").and_then(|value| value.as_bool()),
                 reasoning_items: reasoning_items_from_response_output(resp),
+                doom_loop_triggers: doom_loop_triggers_from(resp),
+                usage: resp.get("usage").and_then(openai_responses_usage),
             }))
         }
         // Grok Build / cli-chat-proxy: `response.doom_loop_check` with
         // `doom_loop_check.triggers` like `tail_repetition:8@thinking`.
-        // `.devrefs/references/xai-org/grok-build/crates/codegen/xai-grok-sampler/src/doom_loop.rs`
+        // Also present on `response.completed` (`doom_loop_check` field).
+        // `.devrefs/references/xai-org/grok-build/crates/codegen/xai-grok-sampling-types/src/doom_loop.rs`
         "response.doom_loop_check" => {
-            let triggers = value
-                .pointer("/doom_loop_check/triggers")
-                .and_then(|value| value.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+            let triggers = doom_loop_triggers_from(&value).join(",");
             Some(Ok(ChunkType::Metadata(format!(
                 "doom_loop_check triggers={triggers}"
             ))))
@@ -1593,7 +1584,7 @@ fn response_sse_data_to_chunk(data: &str) -> Option<Result<ChunkType>> {
 
 /// Log Responses API usage for prompt-cache visibility.
 /// Looks for `input_tokens_details.cached_tokens` (OpenAI/xAI shape).
-fn log_openai_responses_usage(usage: &serde_json::Value) {
+fn openai_responses_usage(usage: &serde_json::Value) -> Option<crate::chunk::TokenUsage> {
     let input = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
@@ -1610,7 +1601,7 @@ fn log_openai_responses_usage(usage: &serde_json::Value) {
         .unwrap_or(0);
 
     if input.is_none() && output.is_none() && cached == 0 {
-        return;
+        return None;
     }
 
     let input_v = input.unwrap_or(0);
@@ -1627,6 +1618,75 @@ fn log_openai_responses_usage(usage: &serde_json::Value) {
         cached,
         hit_pct
     ));
+
+    Some(crate::chunk::TokenUsage {
+        input: input_v.saturating_sub(cached),
+        output: output.unwrap_or(0),
+        cache_read: cached,
+        cache_write: 0,
+    })
+}
+
+/// Attribute a `response.completed` payload: status, incomplete reason, and
+/// output item types. Needed when a turn finishes with no error after
+/// reasoning-only / empty assistant output.
+fn log_openai_responses_completed(response: &serde_json::Value) {
+    let status = response
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let end_turn = response.get("end_turn").and_then(|value| value.as_bool());
+    let incomplete_reason = response
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    let (output_count, output_types) = summarize_response_output_types(response);
+
+    let doom_loop_triggers = doom_loop_triggers_from(response);
+    let doom_loop = if doom_loop_triggers.is_empty() {
+        "none".to_string()
+    } else {
+        doom_loop_triggers.join(",")
+    };
+
+    crate::log::log(&format!(
+        "openai-responses completed status={status} end_turn={end_turn:?} incomplete_reason={incomplete_reason} output_count={output_count} output_types=[{output_types}] doom_loop_check={doom_loop}"
+    ));
+}
+
+fn doom_loop_triggers_from(value: &serde_json::Value) -> Vec<String> {
+    value
+        .pointer("/doom_loop_check/triggers")
+        .or_else(|| value.pointer("/response/doom_loop_check/triggers"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn summarize_response_output_types(response: &serde_json::Value) -> (usize, String) {
+    let Some(output) = response.get("output").and_then(|value| value.as_array()) else {
+        return (0, String::new());
+    };
+
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for item in output {
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        *counts.entry(item_type).or_default() += 1;
+    }
+
+    let output_types = counts
+        .into_iter()
+        .map(|(item_type, count)| format!("{item_type}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    (output.len(), output_types)
 }
 
 fn responses_provider_error_message(value: &serde_json::Value, fallback: &str) -> String {
@@ -2211,7 +2271,7 @@ fn build_openai_messages(
     strip_system: bool,
     responses_lite: bool,
 ) -> Vec<serde_json::Value> {
-    messages
+    let items = messages
         .iter()
         .filter_map(|msg| {
             if strip_system {
@@ -2269,7 +2329,67 @@ fn build_openai_messages(
                 })),
             }
         })
-        .collect()
+        .collect();
+    dedupe_responses_call_ids(items)
+}
+
+/// Rewrite duplicate `function_call` / `function_call_output` call ids in the
+/// Responses `input` items.
+///
+/// Some OpenAI-compatible relays mint per-request call ids (`call_1`,
+/// `call_2`, ...) that restart on every request. The Responses API requires
+/// every call_id to be unique across the conversation input, so a history that
+/// reuses an id fails with "Duplicate function_call_output". Remap each
+/// repeated call — and its matching output — to a unique id; ids are opaque.
+fn dedupe_responses_call_ids(mut items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    // Occurrence k of a call_id pairs with occurrence k of its output, so
+    // track counts per call_id instead of assuming strict call/output order.
+    let mut call_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut output_occurrences: HashMap<String, usize> = HashMap::new();
+
+    for item in items.iter_mut() {
+        match item.get("type").and_then(|value| value.as_str()) {
+            Some("function_call") => {
+                let Some(call_id) = item
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let occurrence = call_occurrences.entry(call_id.clone()).or_insert(0);
+                *occurrence += 1;
+                if *occurrence == 1 {
+                    continue;
+                }
+                let new_id = format!("{call_id}_dup{occurrence}");
+                item["call_id"] = serde_json::Value::String(new_id);
+                // The item id belongs to the original response; drop it so the
+                // rewritten pair cannot collide on item ids either.
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("id");
+                }
+            }
+            Some("function_call_output") => {
+                let Some(call_id) = item
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let occurrence = output_occurrences.entry(call_id.clone()).or_insert(0);
+                *occurrence += 1;
+                if *occurrence > 1 {
+                    item["call_id"] =
+                        serde_json::Value::String(format!("{call_id}_dup{occurrence}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    items
 }
 
 fn responses_lite_message(role: &str, text_type: &str, text: String) -> serde_json::Value {
@@ -2348,10 +2468,10 @@ mod tests {
         add_responses_lite_header, build_openai_messages, build_websocket_request_body,
         fresh_websocket_request_body, is_client_tool_call_event, openai_chunk_is_terminal,
         request_snapshot_from_body, response_sse_data_to_chunk, responses_function_call_chunk,
-        websocket_connection_is_idle, websocket_continuation_mode_after_idle_policy,
-        websocket_continuation_mode_from_state, OpenAI, OpenAIResponseSnapshot,
-        OpenAIWebsocketState, WebsocketContinuationMode, WebsocketStreamProgress,
-        OPENAI_CODEX_WINDOW_ID_HEADER, OPENAI_RESPONSES_LITE_HEADER,
+        summarize_response_output_types, websocket_connection_is_idle,
+        websocket_continuation_mode_after_idle_policy, websocket_continuation_mode_from_state,
+        OpenAI, OpenAIResponseSnapshot, OpenAIWebsocketState, WebsocketContinuationMode,
+        WebsocketStreamProgress, OPENAI_CODEX_WINDOW_ID_HEADER, OPENAI_RESPONSES_LITE_HEADER,
         OPENAI_RESPONSES_LITE_WS_METADATA_KEY, OPENAI_WEBSOCKET_FAILURES_BEFORE_FALLBACK,
         OPENAI_WEBSOCKET_IDLE_MAX,
     };
@@ -2371,6 +2491,45 @@ mod tests {
             .expect("api key should be optional");
 
         assert!(provider.api_key.is_empty());
+    }
+
+    #[test]
+    fn default_responses_path_does_not_duplicate_v1_in_base_url() {
+        // Models.dev routes some gateway models (e.g. opencode-go /
+        // muse-spark-1.3-contributor) through `@ai-sdk/openai` while their
+        // base URL already ends in a version segment. The default Responses
+        // path must not append another `/v1` (which produced
+        // `/v1/v1/responses` 404s).
+        let provider = OpenAI::builder()
+            .base_url("https://opencode.ai/zen/go/v1")
+            .model_name("muse-spark-1.3-contributor")
+            .build()
+            .unwrap();
+        assert_eq!(provider.responses_path, "/responses");
+
+        let provider = OpenAI::builder()
+            .base_url("https://api.openai.com")
+            .model_name("gpt-test")
+            .build()
+            .unwrap();
+        assert_eq!(provider.responses_path, "/v1/responses");
+    }
+
+    #[test]
+    fn default_responses_path_handles_non_v1_version_segments() {
+        let provider = OpenAI::builder()
+            .base_url("https://gateway.example.com/v2")
+            .model_name("gpt-test")
+            .build()
+            .unwrap();
+        assert_eq!(provider.responses_path, "/responses");
+
+        let provider = OpenAI::builder()
+            .base_url("https://gateway.example.com/v2/")
+            .model_name("gpt-test")
+            .build()
+            .unwrap();
+        assert_eq!(provider.responses_path, "/responses");
     }
 
     #[test]
@@ -2433,6 +2592,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn response_completed_captures_usage_minus_cached_tokens() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":120,"output_tokens":30,"input_tokens_details":{"cached_tokens":40}}}}"#,
+        )
+        .expect("expected terminal chunk");
+
+        match chunk {
+            Ok(ChunkType::ResponseCompleted { usage, .. }) => {
+                assert_eq!(
+                    usage,
+                    Some(crate::chunk::TokenUsage {
+                        input: 80,
+                        output: 30,
+                        cache_read: 40,
+                        cache_write: 0,
+                    })
+                );
+            }
+            other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2762,6 +2944,44 @@ mod tests {
     }
 
     #[test]
+    fn dedupes_repeated_call_ids_across_turns_for_responses_input() {
+        // Relays that mint per-request ids (call_1, ...) restart numbering on
+        // every request; the stored history then repeats ids across turns.
+        let input = build_openai_messages(
+            &[
+                Message::user("list files"),
+                Message::tool_call("call_1", "glob", "{}"),
+                Message::tool_output("call_1", "glob", "src/main.rs", false),
+                Message::tool_call("call_1", "read", "{}"),
+                Message::tool_output("call_1", "read", "fn main() {}", false),
+                Message::tool_call("call_1", "grep", "{}"),
+                Message::tool_output("call_1", "grep", "no matches", false),
+            ],
+            false,
+            false,
+        );
+
+        let call_ids: Vec<&str> = input
+            .iter()
+            .filter(|item| item.get("call_id").is_some())
+            .map(|item| item["call_id"].as_str().expect("call_id"))
+            .collect();
+        assert_eq!(
+            call_ids,
+            [
+                "call_1",
+                "call_1",
+                "call_1_dup2",
+                "call_1_dup2",
+                "call_1_dup3",
+                "call_1_dup3"
+            ]
+        );
+        // Rewritten calls must not keep a stale response item id.
+        assert!(input[3].get("id").is_none());
+    }
+
+    #[test]
     fn serializes_tool_image_output_for_responses_input() {
         let input = build_openai_messages(
             &[Message::tool_output_with_images(
@@ -2911,6 +3131,49 @@ mod tests {
             }
             other => panic!("expected ResponseCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn response_completed_captures_terminal_doom_loop_triggers() {
+        let chunk = response_sse_data_to_chunk(
+            r#"{"type":"response.completed","response":{"output":[{"type":"reasoning","id":"rs_1"}],"doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}}"#,
+        )
+        .expect("expected terminal chunk");
+
+        match chunk {
+            Ok(ChunkType::ResponseCompleted {
+                doom_loop_triggers, ..
+            }) => {
+                assert_eq!(
+                    doom_loop_triggers,
+                    vec!["tail_repetition:8@thinking".to_string()]
+                );
+            }
+            other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summarize_response_output_types_counts_reasoning_and_function_calls() {
+        let response = serde_json::json!({
+            "output": [
+                {"type": "reasoning", "id": "rs_1"},
+                {"type": "function_call", "call_id": "call_1", "name": "read"},
+                {"type": "function_call", "call_id": "call_2", "name": "read"},
+            ]
+        });
+        let (count, types) = summarize_response_output_types(&response);
+        assert_eq!(count, 3);
+        assert_eq!(types, "function_call=2,reasoning=1");
+    }
+
+    #[test]
+    fn summarize_response_output_types_empty_when_missing_output() {
+        let response = serde_json::json!({"status": "completed"});
+        assert_eq!(
+            summarize_response_output_types(&response),
+            (0, String::new())
+        );
     }
 
     #[test]

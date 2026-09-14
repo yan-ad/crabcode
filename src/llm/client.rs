@@ -914,13 +914,57 @@ fn resolve_api_key(
     configured_api_key(auth_config).or(custom_provider_api_key)
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactionSummary {
+    pub text: String,
+    pub usage: crate::aisdk::chunk::TokenUsage,
+}
+
+fn apply_compaction_stream_chunk(
+    summary: &mut String,
+    usage: &mut crate::aisdk::chunk::TokenUsage,
+    chunk: ChunkType,
+) -> Result<(), DynError> {
+    match chunk {
+        ChunkType::Text(text) => summary.push_str(&text),
+        ChunkType::Failed(err) => {
+            return Err(anyhow::anyhow!("Compaction failed: {}", err).into());
+        }
+        ChunkType::NotSupported(msg) => {
+            return Err(anyhow::anyhow!("Compaction unsupported: {}", msg).into());
+        }
+        ChunkType::Usage(chunk_usage) => {
+            *usage = usage.saturating_add(chunk_usage);
+        }
+        ChunkType::StreamRollback { text, .. } => {
+            if summary.ends_with(&text) {
+                summary.truncate(summary.len() - text.len());
+            }
+        }
+        ChunkType::Reasoning(_)
+        | ChunkType::ReasoningItem(_)
+        | ChunkType::ToolCall(_)
+        | ChunkType::ProviderToolCall(_)
+        | ChunkType::End { .. }
+        | ChunkType::AssistantMessagePhase { .. }
+        | ChunkType::ResponseCompleted { .. }
+        | ChunkType::Retry(_)
+        | ChunkType::RetryableFailure(_)
+        | ChunkType::Warning(_)
+        | ChunkType::Metadata(_)
+        | ChunkType::Start
+        | ChunkType::Incomplete(_) => {}
+    }
+    Ok(())
+}
+
 pub async fn summarize_for_compaction(
     provider_name: String,
     model: String,
     reasoning_effort: Option<crate::model::reasoning::ReasoningEffort>,
     prompt: String,
     cancel_token: CancellationToken,
-) -> Result<String, DynError> {
+) -> Result<CompactionSummary, DynError> {
     if cancel_token.is_cancelled() {
         return Err(anyhow::anyhow!("Compaction cancelled by user").into());
     }
@@ -939,6 +983,7 @@ pub async fn summarize_for_compaction(
     .await?;
 
     let mut summary = String::new();
+    let mut usage = crate::aisdk::chunk::TokenUsage::default();
     loop {
         let chunk = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -951,33 +996,7 @@ pub async fn summarize_for_compaction(
             break;
         };
 
-        match chunk {
-            ChunkType::Text(text) => summary.push_str(&text),
-            ChunkType::Failed(err) => {
-                return Err(anyhow::anyhow!("Compaction failed: {}", err).into());
-            }
-            ChunkType::NotSupported(msg) => {
-                return Err(anyhow::anyhow!("Compaction unsupported: {}", msg).into());
-            }
-            ChunkType::Reasoning(_)
-            | ChunkType::ReasoningItem(_)
-            | ChunkType::ToolCall(_)
-            | ChunkType::ProviderToolCall(_)
-            | ChunkType::End { .. }
-            | ChunkType::AssistantMessagePhase { .. }
-            | ChunkType::ResponseCompleted { .. }
-            | ChunkType::Retry(_)
-            | ChunkType::RetryableFailure(_)
-            | ChunkType::Warning(_)
-            | ChunkType::Metadata(_)
-            | ChunkType::Start
-            | ChunkType::Incomplete(_) => {}
-            ChunkType::StreamRollback { text, .. } => {
-                if summary.ends_with(&text) {
-                    summary.truncate(summary.len() - text.len());
-                }
-            }
-        }
+        apply_compaction_stream_chunk(&mut summary, &mut usage, chunk)?;
     }
 
     if cancel_token.is_cancelled() {
@@ -989,7 +1008,10 @@ pub async fn summarize_for_compaction(
         return Err(anyhow::anyhow!("Compaction returned an empty summary").into());
     }
 
-    Ok(summary)
+    Ok(CompactionSummary {
+        text: summary,
+        usage,
+    })
 }
 
 pub async fn generate_session_title(
@@ -1029,6 +1051,7 @@ pub async fn generate_session_title(
             | ChunkType::RetryableFailure(_)
             | ChunkType::Warning(_)
             | ChunkType::Metadata(_)
+            | ChunkType::Usage(_)
             | ChunkType::Start
             | ChunkType::Incomplete(_) => {}
             ChunkType::StreamRollback { text, .. } => {
@@ -1044,6 +1067,130 @@ pub async fn generate_session_title(
         return Err(anyhow::anyhow!("Title generation returned an empty title").into());
     }
     Ok(title)
+}
+
+/// Max history tokens attached to a `/btw` side question. Keeps the aside
+/// cheap: newest turns plus the compaction summary (compressed history).
+const BTW_HISTORY_MAX_TOKENS: usize = 8_000;
+
+/// Build `/btw` context from session history with the usual harness
+/// optimizations: compaction boundary (post-summary slice only), drop
+/// in-flight partials, newest-first token budget. The leading compaction
+/// summary is always preserved when present since it *is* the compressed
+/// history.
+fn btw_context_messages(
+    history: &[crate::session::types::Message],
+) -> Vec<crate::session::types::Message> {
+    let complete: Vec<crate::session::types::Message> = history
+        .iter()
+        .filter(|message| message.is_complete)
+        .cloned()
+        .collect();
+    let context = crate::session::compaction::filter_messages_for_context(&complete);
+    let (summary, rest) = match context.first() {
+        Some(first) if crate::session::compaction::is_compaction_summary(first) => {
+            (Some(first.clone()), &context[1..])
+        }
+        _ => (None, &context[..]),
+    };
+    let summary_tokens = summary
+        .as_ref()
+        .map(crate::session::compaction::message_context_tokens)
+        .unwrap_or(0);
+    let mut budget = BTW_HISTORY_MAX_TOKENS.saturating_sub(summary_tokens);
+    let mut kept: Vec<crate::session::types::Message> = Vec::new();
+    for message in rest.iter().rev() {
+        let tokens = crate::session::compaction::message_context_tokens(message);
+        if tokens > budget && !kept.is_empty() {
+            break;
+        }
+        budget = budget.saturating_sub(tokens.min(budget));
+        kept.push(message.clone());
+    }
+    kept.reverse();
+    match summary {
+        Some(summary) => std::iter::once(summary).chain(kept).collect(),
+        None => kept,
+    }
+}
+
+/// Lightweight side answer for `/btw`: no tools, but with session history.
+///
+/// Like [`generate_session_title`], this bypasses the main streaming turn so it
+/// can run while the agent is busy. The question and answer are never added to
+/// the main turn — callers must keep them out of `chat_state.chat.messages`.
+pub async fn generate_btw_answer(
+    provider_name: String,
+    model: String,
+    question: String,
+    history: Vec<crate::session::types::Message>,
+) -> Result<String, DynError> {
+    let (warning_sender, _warning_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let request_config =
+        prepare_request_config(&provider_name, model, None, &warning_sender).await?;
+    let context = btw_context_messages(&history);
+    crate::emit_log!(
+        "BTW history_messages={} context_messages={} question_chars={}",
+        history.len(),
+        context.len(),
+        question.trim().len()
+    );
+    let mut messages =
+        convert_messages_for_model(&context, request_config.supports_image_input, false);
+    messages.push(AisdkMessage::system(
+        "You are answering a quick side question about the ongoing conversation. Be concise. No tools are available; answer from the conversation context and general knowledge.",
+    ));
+    if context.is_empty() {
+        messages.push(AisdkMessage::user(format!(
+            "Side question:\n{}",
+            question.trim()
+        )));
+    } else {
+        messages.push(AisdkMessage::user(format!(
+            "Side question about the conversation above:\n{}",
+            question.trim()
+        )));
+    }
+    let mut response =
+        stream_provider_request(&request_config, messages, Vec::new(), None, None).await?;
+
+    let mut answer = String::new();
+    while let Some(chunk) = response.stream.next().await {
+        match chunk {
+            ChunkType::Text(text) => answer.push_str(&text),
+            ChunkType::Failed(err) => {
+                return Err(anyhow::anyhow!("btw request failed: {}", err).into());
+            }
+            ChunkType::NotSupported(msg) => {
+                return Err(anyhow::anyhow!("btw request unsupported: {}", msg).into());
+            }
+            ChunkType::Reasoning(_)
+            | ChunkType::ReasoningItem(_)
+            | ChunkType::ToolCall(_)
+            | ChunkType::ProviderToolCall(_)
+            | ChunkType::End { .. }
+            | ChunkType::AssistantMessagePhase { .. }
+            | ChunkType::ResponseCompleted { .. }
+            | ChunkType::Retry(_)
+            | ChunkType::RetryableFailure(_)
+            | ChunkType::Warning(_)
+            | ChunkType::Metadata(_)
+            | ChunkType::Usage(_)
+            | ChunkType::Start
+            | ChunkType::Incomplete(_) => {}
+            ChunkType::StreamRollback { text, .. } => {
+                if answer.ends_with(&text) {
+                    answer.truncate(answer.len() - text.len());
+                }
+            }
+        }
+    }
+
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        return Err(anyhow::anyhow!("btw request returned an empty answer").into());
+    }
+    Ok(answer)
 }
 
 fn sanitize_generated_title(raw: &str) -> String {
@@ -1408,17 +1555,9 @@ async fn maybe_apply_openai_oauth_overrides(
 
     crate::emit_log!("Configured OpenAI OAuth Codex transport");
 
-    if !is_openai_oauth_model_allowed(&request_config.model_name) {
-        let fallback_model = "gpt-5.3-codex".to_string();
-        send_warning(
-            sender,
-            format!(
-                "Model '{}' is not supported for OpenAI OAuth. Falling back to '{}'.",
-                request_config.model_name, fallback_model
-            ),
-        );
-        request_config.model_name = fallback_model;
-    }
+    // No client-side allowlist: like Codex CLI, the server catalog is the source
+    // of truth. Unsupported models surface as server errors instead of a silent
+    // client-side swap.
     request_config.openai_options.use_responses_lite =
         openai_oauth_model_uses_responses_lite(&request_config.model_name);
     let default_originator =
@@ -1604,7 +1743,13 @@ async fn stream_provider_request(
     max_steps: Option<usize>,
     cancel_token: Option<CancellationToken>,
 ) -> Result<StreamTextResponse, DynError> {
-    let headers = HashMap::new();
+    let headers = super::opencode::ensure_session_headers(
+        &config.provider_name,
+        &config.base_url,
+        &config.openai_options.additional_headers,
+        config.openai_options.prompt_cache_key.as_deref(),
+        &std::collections::HashMap::new(),
+    );
     match config.kind {
         ProviderKind::OpenAICompatible => {
             let mut builder = OpenAICompatible::builder()
@@ -1695,9 +1840,6 @@ async fn stream_provider_request(
             }
             if let Some(cache_key) = config.openai_options.prompt_cache_key.as_deref() {
                 builder = builder.prompt_cache_key(cache_key);
-            }
-            if !config.openai_options.additional_headers.is_empty() {
-                builder = builder.headers(config.openai_options.additional_headers.clone());
             }
             if let Some(policy) =
                 super::xai_build::retry_policy_for(&config.openai_options.additional_headers)
@@ -1977,6 +2119,11 @@ async fn relay_stream_to_sender(
                 stats.record_chunk("Metadata", elapsed_ms);
                 stats.record_metadata(&message);
                 crate::emit_log!("[RELAY] Metadata {}", message);
+            }
+            ChunkType::Usage(usage) => {
+                let elapsed_ms = start_time.elapsed().as_millis();
+                stats.record_chunk("Usage", elapsed_ms);
+                let _ = sender.send(crate::llm::ChunkMessage::Usage(usage));
             }
             ChunkType::Retry(status) => {
                 let elapsed_ms = start_time.elapsed().as_millis();
@@ -2520,17 +2667,17 @@ fn is_vercel_ai_gateway(provider_name: &str, npm_package: &str) -> bool {
     provider_name == "vercel" || npm_package == "@ai-sdk/gateway"
 }
 
-fn is_openai_oauth_model_allowed(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model.contains("codex") || is_openai_oauth_gpt5_model(&model)
-}
-
 fn openai_oauth_model_uses_responses_lite(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_prefix("openai/").unwrap_or(&model);
-    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        .iter()
-        .any(|lite_model| model == *lite_model || model.starts_with(&format!("{lite_model}-")))
+    [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-astra",
+    ]
+    .iter()
+    .any(|lite_model| model == *lite_model || model.starts_with(&format!("{lite_model}-")))
 }
 
 fn openai_oauth_default_originator(use_responses_lite: bool) -> &'static str {
@@ -2539,15 +2686,6 @@ fn openai_oauth_default_originator(use_responses_lite: bool) -> &'static str {
     } else {
         "crabcode"
     }
-}
-
-fn is_openai_oauth_gpt5_model(model: &str) -> bool {
-    let model = model.strip_prefix("openai/").unwrap_or(model);
-    if model.contains("-chat") {
-        return false;
-    }
-
-    model == "gpt-5" || model.starts_with("gpt-5.") || model.starts_with("gpt-5-")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2595,15 +2733,87 @@ fn normalize_anthropic_base_url(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_provider_request_defaults, convert_messages, convert_messages_for_model,
-        is_openai_oauth_model_allowed, maybe_apply_unauthenticated_free_provider_key,
-        model_supports_image_input, openai_oauth_default_originator,
-        openai_oauth_model_uses_responses_lite, openai_request_instructions, resolve_api_key,
-        resolve_model_route, ui_vs_request_model_mismatch_warning, vlm_agent_has_model,
-        AisdkMessage, OpenAIRequestOptions, ProviderKind, ProviderRequestConfig,
+        apply_compaction_stream_chunk, apply_provider_request_defaults, btw_context_messages,
+        convert_messages, convert_messages_for_model,
+        maybe_apply_unauthenticated_free_provider_key, model_supports_image_input,
+        openai_oauth_default_originator, openai_oauth_model_uses_responses_lite,
+        openai_request_instructions, resolve_api_key, resolve_model_route,
+        ui_vs_request_model_mismatch_warning, vlm_agent_has_model, AisdkMessage,
+        OpenAIRequestOptions, ProviderKind, ProviderRequestConfig,
     };
+    use crate::aisdk::core::chunk::ChunkType;
 
     use crate::persistence::AuthConfig;
+
+    #[test]
+    fn btw_context_drops_incomplete_and_keeps_newest() {
+        use crate::session::types::Message;
+        let history = vec![
+            Message::user("old question"),
+            Message::assistant("old answer"),
+            Message::incomplete("partial streaming..."),
+        ];
+        let context = btw_context_messages(&history);
+        assert_eq!(context.len(), 2);
+        assert!(context.iter().all(|message| message.is_complete));
+        assert_eq!(
+            context.last().map(|m| m.content.as_str()),
+            Some("old answer")
+        );
+    }
+
+    #[test]
+    fn compaction_stream_accumulates_usage_and_text() {
+        let mut summary = String::new();
+        let mut usage = crate::aisdk::chunk::TokenUsage::default();
+
+        apply_compaction_stream_chunk(&mut summary, &mut usage, ChunkType::Text("hello ".into()))
+            .unwrap();
+        apply_compaction_stream_chunk(
+            &mut summary,
+            &mut usage,
+            ChunkType::Usage(crate::aisdk::chunk::TokenUsage {
+                input: 1_000,
+                output: 40,
+                cache_read: 200,
+                cache_write: 10,
+            }),
+        )
+        .unwrap();
+        apply_compaction_stream_chunk(
+            &mut summary,
+            &mut usage,
+            ChunkType::Usage(crate::aisdk::chunk::TokenUsage {
+                input: 50,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+            }),
+        )
+        .unwrap();
+        apply_compaction_stream_chunk(&mut summary, &mut usage, ChunkType::Text("world".into()))
+            .unwrap();
+        apply_compaction_stream_chunk(
+            &mut summary,
+            &mut usage,
+            ChunkType::StreamRollback {
+                text: "world".into(),
+                reasoning: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary, "hello ");
+        assert_eq!(
+            usage,
+            crate::aisdk::chunk::TokenUsage {
+                input: 1_050,
+                output: 50,
+                cache_read: 200,
+                cache_write: 10,
+            }
+        );
+    }
 
     #[test]
     fn stored_auth_takes_precedence_over_custom_provider_api_key() {
@@ -2658,19 +2868,16 @@ mod tests {
     }
 
     #[test]
-    fn openai_oauth_allows_versioned_gpt5_models() {
-        assert!(is_openai_oauth_model_allowed("gpt-5.4"));
-        assert!(is_openai_oauth_model_allowed("gpt-5.5"));
-        assert!(is_openai_oauth_model_allowed("openai/gpt-5.6"));
-    }
-
-    #[test]
     fn openai_oauth_uses_responses_lite_only_for_current_gpt56_codex_models() {
         assert!(openai_oauth_model_uses_responses_lite("gpt-5.6-sol"));
         assert!(openai_oauth_model_uses_responses_lite(
             "openai/gpt-5.6-terra"
         ));
         assert!(openai_oauth_model_uses_responses_lite("gpt-5.6-luna-high"));
+        assert!(openai_oauth_model_uses_responses_lite("gpt-6-astra"));
+        assert!(openai_oauth_model_uses_responses_lite(
+            "openai/gpt-6-astra-wm"
+        ));
         assert!(!openai_oauth_model_uses_responses_lite("gpt-5.5"));
         assert!(!openai_oauth_model_uses_responses_lite("gpt-5.3-codex"));
     }
@@ -2679,18 +2886,6 @@ mod tests {
     fn openai_oauth_uses_codex_originator_only_for_responses_lite() {
         assert_eq!(openai_oauth_default_originator(true), "codex_cli_rs");
         assert_eq!(openai_oauth_default_originator(false), "crabcode");
-    }
-
-    #[test]
-    fn openai_oauth_allows_codex_named_models() {
-        assert!(is_openai_oauth_model_allowed("gpt-5.3-codex"));
-        assert!(is_openai_oauth_model_allowed("codex-mini-latest"));
-    }
-
-    #[test]
-    fn openai_oauth_rejects_known_non_codex_chat_models() {
-        assert!(!is_openai_oauth_model_allowed("gpt-5-chat-latest"));
-        assert!(!is_openai_oauth_model_allowed("gpt-4o"));
     }
 
     #[test]

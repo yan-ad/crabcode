@@ -62,6 +62,7 @@ pub struct Message {
     pub t1_ms: Option<i64>,
     pub tn_ms: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub tokens_per_sec: Option<f64>,
 }
 
 pub struct HistoryDAO {
@@ -438,9 +439,9 @@ impl HistoryDAO {
         self.conn.execute(
             "INSERT INTO messages (
                  id, session_id, role, parts, timestamp, tokens_used, model, provider, agent_mode, duration_ms,
-                 t0_ms, t1_ms, tn_ms, output_tokens
+                 t0_ms, t1_ms, tn_ms, output_tokens, tokens_per_sec
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &msg.id,
                 msg.session_id,
@@ -456,10 +457,16 @@ impl HistoryDAO {
                 msg.t1_ms,
                 msg.tn_ms,
                 msg.output_tokens,
+                msg.tokens_per_sec,
             ],
         )?;
 
-        self.update_session_stats(msg.session_id, msg.tokens_used, 0.0, msg.timestamp)?;
+        self.update_session_stats(
+            msg.session_id,
+            msg.tokens_used,
+            usage_cost_from_parts(&msg.parts),
+            msg.timestamp,
+        )?;
         Ok(())
     }
 
@@ -476,20 +483,22 @@ impl HistoryDAO {
         )?;
 
         let mut total_tokens: i64 = 0;
+        let mut total_cost = 0.0;
         let mut updated_at = chrono::Utc::now().timestamp();
 
         {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages (
                      id, session_id, role, parts, timestamp, tokens_used, model, provider, agent_mode, duration_ms,
-                     t0_ms, t1_ms, tn_ms, output_tokens
+                     t0_ms, t1_ms, tn_ms, output_tokens, tokens_per_sec
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
 
             for msg in messages {
                 let parts_json = serde_json::to_string(&msg.parts)?;
                 total_tokens += msg.tokens_used as i64;
+                total_cost += usage_cost_from_parts(&msg.parts);
                 updated_at = msg.timestamp;
 
                 insert.execute(params![
@@ -507,6 +516,7 @@ impl HistoryDAO {
                     msg.t1_ms,
                     msg.tn_ms,
                     msg.output_tokens,
+                    msg.tokens_per_sec,
                 ])?;
             }
         }
@@ -525,13 +535,14 @@ impl HistoryDAO {
         tx.execute(
             "UPDATE sessions
              SET total_tokens = ?1,
-                 total_cost = 0,
-                 total_time_sec = ?2,
-                 avg_tokens_per_sec = ?3,
-                 updated_at = ?4
-             WHERE id = ?5",
+                 total_cost = ?2,
+                 total_time_sec = ?3,
+                 avg_tokens_per_sec = ?4,
+                 updated_at = ?5
+             WHERE id = ?6",
             params![
                 total_tokens,
+                total_cost,
                 total_time_sec,
                 avg_tokens_per_sec,
                 updated_at,
@@ -547,7 +558,7 @@ impl HistoryDAO {
     pub fn get_messages(&self, session_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, role, parts, timestamp, tokens_used, model, provider, agent_mode, duration_ms,
-                    t0_ms, t1_ms, tn_ms, output_tokens
+                    t0_ms, t1_ms, tn_ms, output_tokens, tokens_per_sec
              FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, rowid ASC",
         )?;
 
@@ -570,6 +581,7 @@ impl HistoryDAO {
                 t1_ms: row.get(11)?,
                 tn_ms: row.get(12)?,
                 output_tokens: row.get(13)?,
+                tokens_per_sec: row.get(14).unwrap_or(None),
             })
         })?;
 
@@ -747,4 +759,43 @@ fn ensure_workspace(conn: &Connection, root_path: &str, display_name: &str) -> R
         params![root_path, display_name, next_sort_order],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+fn usage_cost_from_parts(parts: &[MessagePart]) -> f64 {
+    parts
+        .iter()
+        .filter(|part| part.part_type == "usage")
+        .filter_map(|part| part.data.get("cost")?.as_f64())
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_cost_sums_usage_parts() {
+        let parts = vec![
+            MessagePart {
+                part_type: "text".to_string(),
+                data: serde_json::json!({ "text": "hi" }),
+            },
+            MessagePart {
+                part_type: "usage".to_string(),
+                data: serde_json::json!({
+                    "input": 1000,
+                    "output": 100,
+                    "cache_read": 500,
+                    "cache_write": 50,
+                    "cost": 0.01,
+                }),
+            },
+            MessagePart {
+                part_type: "usage".to_string(),
+                data: serde_json::json!({ "cost": 0.02 }),
+            },
+        ];
+
+        assert!((usage_cost_from_parts(&parts) - 0.03).abs() < f64::EPSILON);
+    }
 }

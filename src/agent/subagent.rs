@@ -225,6 +225,11 @@ pub async fn run_subagent(
                     message
                 );
             }
+            ChunkType::Usage(usage) => {
+                if let Some(sender) = sender.as_ref() {
+                    let _ = sender.send(crate::llm::ChunkMessage::Usage(usage));
+                }
+            }
             ChunkType::Retry(status) => {
                 if let Some(sender) = sender.as_ref() {
                     let _ = sender.send(crate::llm::ChunkMessage::Retry(status));
@@ -318,6 +323,11 @@ pub async fn run_subagent(
                         message
                     );
                 }
+                ChunkType::Usage(usage) => {
+                    if let Some(sender) = sender.as_ref() {
+                        let _ = sender.send(crate::llm::ChunkMessage::Usage(usage));
+                    }
+                }
                 ChunkType::Retry(status) => {
                     if let Some(sender) = sender.as_ref() {
                         let _ = sender.send(crate::llm::ChunkMessage::Retry(status));
@@ -373,6 +383,17 @@ async fn start_subagent_stream(
 ) -> Result<crate::aisdk::core::response::StreamTextResponse, String> {
     use crate::aisdk::core::response::stream_with_tools;
     use crate::aisdk::{Anthropic, OpenAI, OpenAICompatible};
+
+    let headers = crate::llm::opencode::ensure_session_headers(
+        &session.provider_name,
+        &session.base_url,
+        &session.openai_options.additional_headers,
+        session
+            .prompt_cache_key
+            .as_deref()
+            .or(session.openai_options.prompt_cache_key.as_deref()),
+        &headers,
+    );
 
     match session.provider_kind {
         ProviderKind::OpenAICompatible => {
@@ -467,9 +488,6 @@ async fn start_subagent_stream(
                 .or(session.openai_options.prompt_cache_key.as_deref())
             {
                 builder = builder.prompt_cache_key(cache_key);
-            }
-            if !session.openai_options.additional_headers.is_empty() {
-                builder = builder.headers(session.openai_options.additional_headers.clone());
             }
             let provider = builder
                 .build()

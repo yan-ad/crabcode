@@ -80,13 +80,27 @@ It works (almost) exactly like OpenCode. Just opens faster, with some intuitive 
 
 ### Shell Completion
 
-Generate a completion script for the current shell:
-
 ```sh
-crabcode completion >> ~/.zshrc
+crabcode completion zsh --install
 ```
 
-`crabcode completion` generates Zsh completions when `$SHELL` ends in `zsh`; it generates Bash completions for all other shells.
+Same for `bash`, `fish`, `elvish`, `powershell`. Restart the shell, then Tab.
+
+`--install` writes the script to the shell autoload path (`$XDG_DATA_HOME` / `$XDG_CONFIG_HOME` when set) and a small marked block in your rc (zsh/bash/elvish/powershell). Zsh autoloads on first Tab (`fpath` + `compdef`, no `source` of the script at startup). Fish autoloads from `~/.config/fish/completions` with no rc edit. Bash uses `~/.bashrc` if present, otherwise `~/.bash_profile`. PowerShell dotsources `"$HOME/..."`. If `.zshrc` has `alias cc=crabcode` (or similar), that name is included in the zsh script.
+
+Without `--install`, the script is printed to stdout. `crabcode completion` with no shell uses `$SHELL` (zsh/fish/elvish/pwsh, else bash).
+
+If you previously ran `crabcode completion >> ~/.zshrc`, re-run `--install` so that dump is stripped and replaced by the autoload hook.
+
+### Pull Requests
+
+Fetch and checkout a GitHub pull request as `pr/<number>`, then start Crabcode in the checked-out worktree:
+
+```sh
+crabcode pr <number>
+```
+
+This command requires the authenticated [GitHub CLI](https://cli.github.com/). For pull requests from forks, Crabcode also adds the fork as a Git remote when needed and configures the local branch to track the contributor's branch.
 
 ### Agent Types
 

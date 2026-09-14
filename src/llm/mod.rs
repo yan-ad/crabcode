@@ -1,4 +1,5 @@
 pub mod client;
+pub(crate) mod opencode;
 pub mod provider;
 pub mod tool_calls;
 pub(crate) mod xai_build;
@@ -17,6 +18,7 @@ pub enum ChunkMessage {
         reasoning: String,
     },
     Warning(String),
+    Usage(crate::aisdk::chunk::TokenUsage),
     ToolCalls(Vec<ToolCall>),
     ToolResult(ToolCallResult),
     SubagentStarted {

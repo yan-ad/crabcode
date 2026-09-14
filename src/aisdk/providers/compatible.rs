@@ -19,6 +19,7 @@ pub struct OpenAICompatible {
     provider_name: String,
     reasoning_effort: Option<String>,
     prompt_cache_key: Option<String>,
+    default_headers: HashMap<String, String>,
 
     /// Vercel AI Gateway: set `providerOptions.gateway.caching = "auto"` so
     /// Anthropic (and MiniMax) models get explicit cache breakpoints.
@@ -39,6 +40,7 @@ pub struct OpenAICompatibleBuilder {
     provider_name: Option<String>,
     reasoning_effort: Option<String>,
     prompt_cache_key: Option<String>,
+    default_headers: HashMap<String, String>,
 
     gateway_caching_auto: bool,
 }
@@ -79,6 +81,13 @@ impl OpenAICompatibleBuilder {
         self
     }
 
+    /// Static headers set at build time. Per-request `stream_text` headers
+    /// win on conflict.
+    pub fn default_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.default_headers = headers;
+        self
+    }
+
     pub fn build(self) -> Result<OpenAICompatible> {
         Ok(OpenAICompatible {
             base_url: self
@@ -93,6 +102,7 @@ impl OpenAICompatibleBuilder {
                 .unwrap_or_else(|| "openai-compatible".to_string()),
             reasoning_effort: self.reasoning_effort,
             prompt_cache_key: self.prompt_cache_key,
+            default_headers: self.default_headers,
 
             gateway_caching_auto: self.gateway_caching_auto,
         })
@@ -113,10 +123,10 @@ impl Provider for OpenAICompatible {
         &self,
         messages: &[Message],
         tools: &[Tool],
-        _headers: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
     ) -> Result<ProviderStream> {
         let base = self.base_url.trim_end_matches('/');
-        let url = if has_version_segment(base) {
+        let url = if super::base_url_has_version_segment(base) {
             format!("{}/chat/completions", base)
         } else {
             format!("{}/v1/chat/completions", base)
@@ -151,11 +161,7 @@ impl Provider for OpenAICompatible {
             }
         }
 
-        let mut body = serde_json::json!({
-            "model": self.model_name,
-            "messages": chat_messages,
-            "stream": true,
-        });
+        let mut body = openai_compatible_request_body(&self.model_name, chat_messages);
 
         if !tool_params.is_empty() {
             body["tools"] = serde_json::Value::Array(tool_params);
@@ -196,6 +202,8 @@ impl Provider for OpenAICompatible {
                 format!("Bearer {}", self.api_key).parse().unwrap(),
             );
         }
+        super::apply_extra_headers(&mut request_headers, &self.default_headers);
+        super::apply_extra_headers(&mut request_headers, headers);
 
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(
@@ -235,6 +243,20 @@ impl Provider for OpenAICompatible {
 
         Ok(stream)
     }
+}
+
+fn openai_compatible_request_body(
+    model_name: &str,
+    messages: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model_name,
+        "messages": messages,
+        "stream": true,
+        "stream_options": {
+            "include_usage": true
+        }
+    })
 }
 
 fn openai_compatible_user_content(user: &crate::message::UserMessage) -> serde_json::Value {
@@ -436,7 +458,7 @@ fn debug_log(msg: &str) {
 /// Log OpenAI-compatible / AI Gateway usage via the host logger.
 /// Looks for `prompt_tokens_details.cached_tokens` and Anthropic-style fields
 /// that some gateways forward.
-fn log_openai_compatible_usage(usage: &serde_json::Value) {
+fn openai_compatible_usage(usage: &serde_json::Value) -> Option<crate::chunk::TokenUsage> {
     let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion = usage.get("completion_tokens").and_then(|v| v.as_u64());
     let cached = usage
@@ -459,7 +481,7 @@ fn log_openai_compatible_usage(usage: &serde_json::Value) {
         && cache_read == 0
         && cache_creation == 0
     {
-        return;
+        return None;
     }
 
     // Prefer OpenAI-style cached_tokens; fall back to Anthropic-style cache_read.
@@ -489,6 +511,13 @@ fn log_openai_compatible_usage(usage: &serde_json::Value) {
         cache_creation,
         hit_pct
     ));
+
+    Some(crate::chunk::TokenUsage {
+        input: prompt_v.saturating_sub(effective_cached),
+        output: completion.unwrap_or(0),
+        cache_read: effective_cached,
+        cache_write: cache_creation,
+    })
 }
 
 fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
@@ -525,26 +554,30 @@ fn process_sse_data(data: &str) -> Vec<Result<ChunkType>> {
 
     // Final usage often arrives on a choices-empty (or choices-missing) chunk.
     // Log cache-related fields so gateway Anthropic hits are verifiable.
-    if let Some(usage) = value.get("usage") {
-        log_openai_compatible_usage(usage);
-    }
+    let usage = value.get("usage").and_then(openai_compatible_usage);
 
     let Some(choices) = value["choices"].as_array() else {
         debug_log(&format!(
             "[SSE] No choices array. JSON keys: {:?}",
             value.as_object().map(|o| o.keys().collect::<Vec<_>>())
         ));
-        return vec![];
+        return usage
+            .map(|usage| vec![Ok(ChunkType::Usage(usage))])
+            .unwrap_or_default();
     };
 
     if choices.is_empty() {
         debug_log("[SSE] choices array is empty");
-        return vec![];
+        return usage
+            .map(|usage| vec![Ok(ChunkType::Usage(usage))])
+            .unwrap_or_default();
     }
 
     let choice = &choices[0];
     let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
-    let mut chunks = Vec::new();
+    let mut chunks = usage
+        .map(|usage| vec![Ok(ChunkType::Usage(usage))])
+        .unwrap_or_default();
 
     // Log the full choice structure for debugging
     debug_log(&format!(
@@ -649,6 +682,36 @@ mod tests {
             .expect("api key should be optional");
 
         assert!(provider.api_key.is_empty());
+    }
+
+    #[test]
+    fn request_asks_streaming_gateways_for_token_usage() {
+        let body = openai_compatible_request_body(
+            "gpt-test",
+            vec![serde_json::json!({
+                "role": "user",
+                "content": "hi",
+            })],
+        );
+
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn empty_choices_usage_chunk_emits_non_cached_input() {
+        let chunks = process_sse_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":40}}}"#,
+        );
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [Ok(ChunkType::Usage(crate::chunk::TokenUsage {
+                input: 80,
+                output: 30,
+                cache_read: 40,
+                cache_write: 0,
+            }))]
+        ));
     }
 
     #[test]
@@ -925,26 +988,4 @@ fn is_sse_metadata_line(line: &str) -> bool {
         || line.starts_with("event:")
         || line.starts_with("id:")
         || line.starts_with("retry:")
-}
-
-fn has_version_segment(base_url: &str) -> bool {
-    // Check if the URL path already contains a /vN segment (e.g., /v4, /v1)
-    if let Some(pos) = base_url.find("://") {
-        let after_scheme = &base_url[pos + 3..];
-        if let Some(path_start) = after_scheme.find('/') {
-            let path = &after_scheme[path_start..];
-            // Match /vN where N is one or more digits, followed by / or end of string
-            let bytes = path.as_bytes();
-            for i in 0..bytes.len().saturating_sub(2) {
-                if bytes[i] == b'/'
-                    && bytes[i + 1] == b'v'
-                    && bytes[i + 2].is_ascii_digit()
-                    && (i + 3 >= bytes.len() || bytes[i + 3] == b'/')
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

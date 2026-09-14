@@ -12,6 +12,21 @@ pub fn handle_exit<'a>(
     Box::pin(async { CommandResult::Success("Exiting...".to_string()) })
 }
 
+pub fn handle_status<'a>(
+    parsed: &'a ParsedCommand,
+    _sm: &'a mut SessionManager,
+) -> Pin<Box<dyn std::future::Future<Output = CommandResult> + Send + 'a>> {
+    Box::pin(async move {
+        if !parsed.args.is_empty() {
+            return CommandResult::Error(
+                "This command only opens the status dialog. Usage: /status".to_string(),
+            );
+        }
+
+        CommandResult::Success(String::new())
+    })
+}
+
 pub fn handle_title<'a>(
     parsed: &'a ParsedCommand,
     _sm: &'a mut SessionManager,
@@ -248,6 +263,21 @@ pub fn handle_models<'a>(
     Box::pin(async move { load_models(parsed).await })
 }
 
+pub fn handle_variants<'a>(
+    parsed: &'a ParsedCommand,
+    _sm: &'a mut SessionManager,
+) -> Pin<Box<dyn std::future::Future<Output = CommandResult> + Send + 'a>> {
+    let args = parsed.args.clone();
+    Box::pin(async move {
+        if !args.is_empty() {
+            return CommandResult::Error(
+                "This command only opens the variants dialog. Usage: /variants".to_string(),
+            );
+        }
+        CommandResult::Success(String::new())
+    })
+}
+
 pub async fn load_models(parsed: ParsedCommand) -> CommandResult {
     use crate::command::registry::DialogItem;
     use crate::model::discovery::Discovery;
@@ -316,11 +346,14 @@ pub async fn load_models(parsed: ParsedCommand) -> CommandResult {
             || provider_filter_matches_configured
             || provider_filter_matches_unauthenticated_free;
 
+        // Warm-cache fast path first: the snapshot persists across launches, so a
+        // present snapshot means no models.dev fetch is needed at all.
         let snapshot_models = crate::model::effective_catalog::models_for_dialog()
             .ok()
             .flatten();
-        let mut models: Vec<ModelType> = if let Some(models) = snapshot_models.as_ref() {
-            models.clone()
+        let snapshot_present = snapshot_models.is_some();
+        let mut models: Vec<ModelType> = if let Some(models) = snapshot_models {
+            models
         } else if has_persistent {
             match discovery.as_ref() {
                 Ok(d) => match d.fetch_models().await {
@@ -371,18 +404,58 @@ pub async fn load_models(parsed: ParsedCommand) -> CommandResult {
 
         let mut runtime_errors = Vec::new();
         if has_runtime {
-            let runtime_result =
-                crate::model::extensions::ModelExtensions::runtime_models_for_dialog_cached().await;
-            crate::model::discovery::merge_dialog_models(&mut models, runtime_result.models);
-            runtime_errors = runtime_result.errors;
+            // An explicit runtime filter (e.g. `/models ollama`) always takes
+            // the fresh path so newly installed local models are discoverable.
+            let needs_fresh_runtime = !snapshot_present || provider_filter_matches_runtime;
+            if needs_fresh_runtime {
+                let runtime_result =
+                    crate::model::extensions::ModelExtensions::runtime_models_for_dialog_cached()
+                        .await;
+                crate::model::discovery::merge_dialog_models(&mut models, runtime_result.models);
+                runtime_errors = runtime_result.errors;
+            } else {
+                // Warm path: the snapshot already carries last-refresh runtime
+                // rows, so merge only the in-process runtime cache here. This
+                // is synchronous and never spawns `ollama ls`; fresh runtime
+                // discovery stays behind explicit `/refreshmodels`.
+                let cached = crate::model::extensions::ModelExtensions::runtime_models_from_cache();
+                crate::model::discovery::merge_dialog_models(&mut models, cached);
+            }
         }
 
-        if snapshot_models.is_none() && !models.is_empty() {
-            if let Ok(discovery) = Discovery::new_with_custom(None) {
-                if let Ok(snapshot_models) = discovery.fetch_models().await {
-                    if let Err(err) =
-                        crate::model::effective_catalog::publish_refreshed_models(snapshot_models)
-                    {
+        if !snapshot_present && !models.is_empty() {
+            // First-run seed: publish a complete global snapshot via a clean
+            // `Discovery` with no custom providers and no enabled/disabled
+            // filtering, matching `/refreshmodels`. Reusing the dialog rows
+            // above would bake custom overlays and allow/block filtering into
+            // the global file, and a filtered or runtime-only dialog load
+            // would seed an incomplete snapshot. The duplicate fetch only runs
+            // on the cold path (no snapshot yet); warm loads stay fetch-free.
+            // Correctness wins over saving one first-run fetch.
+            if let Ok(clean) = Discovery::new_with_custom(None) {
+                match clean.fetch_models().await {
+                    Ok(seed) => {
+                        // Never seed a runtime-only snapshot when the persistent
+                        // catalog failed or was skipped: that would poison the
+                        // global snapshot with no persistent rows.
+                        let has_persistent_rows = seed.iter().any(|model| {
+                            !crate::model::extensions::ModelExtensions::is_runtime_provider(
+                                &model.provider_id,
+                            )
+                        });
+                        if has_persistent_rows {
+                            if let Err(err) =
+                                crate::model::effective_catalog::publish_refreshed_models(seed)
+                            {
+                                push_toast(Toast::new(
+                                    format!("Failed to seed model catalog cache: {}", err),
+                                    ToastLevel::Warning,
+                                    Some(std::time::Duration::from_secs(3)),
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
                         push_toast(Toast::new(
                             format!("Failed to seed model catalog cache: {}", err),
                             ToastLevel::Warning,
@@ -632,6 +705,23 @@ pub fn handle_compact_mode<'a>(
         }
 
         // The app intercepts /compact-mode to toggle the chat_state.compact_mode flag.
+        CommandResult::Success(String::new())
+    })
+}
+
+pub fn handle_btw<'a>(
+    parsed: &'a ParsedCommand,
+    _sm: &'a mut SessionManager,
+) -> Pin<Box<dyn std::future::Future<Output = CommandResult> + Send + 'a>> {
+    let question = parsed.raw_args().to_string();
+
+    Box::pin(async move {
+        if question.trim().is_empty() {
+            return CommandResult::Error("Usage: /btw <question>".to_string());
+        }
+
+        // The app intercepts /btw because it needs the active provider/model
+        // and must run outside the main streaming turn.
         CommandResult::Success(String::new())
     })
 }
@@ -937,6 +1027,22 @@ pub fn register_all_commands(registry: &mut Registry) {
     });
 
     registry.register(Command {
+        name: "variants".to_string(),
+        description: "Switch model variant".to_string(),
+        handler: handle_variants,
+        hidden_tokens: vec!["reasoning effort".to_string()],
+        chat_only: false,
+    });
+
+    registry.register(Command {
+        name: "status".to_string(),
+        description: "Show status".to_string(),
+        handler: handle_status,
+        hidden_tokens: Vec::new(),
+        chat_only: false,
+    });
+
+    registry.register(Command {
         name: "agents".to_string(),
         description: "Switch agent".to_string(),
         handler: handle_agents,
@@ -962,10 +1068,10 @@ pub fn register_all_commands(registry: &mut Registry) {
 
     registry.register(Command {
         name: "copy".to_string(),
-        description: "Copy session details to clipboard".to_string(),
+        description: "Copy provider/model id or session details to clipboard".to_string(),
         handler: handle_copy,
         hidden_tokens: vec![],
-        chat_only: true,
+        chat_only: false,
     });
 
     registry.register(Command {
@@ -998,6 +1104,14 @@ pub fn register_all_commands(registry: &mut Registry) {
         handler: handle_compact_mode,
         hidden_tokens: vec![],
         chat_only: true,
+    });
+
+    registry.register(Command {
+        name: "btw".to_string(),
+        description: "Ask a side question without interrupting the current task".to_string(),
+        handler: handle_btw,
+        hidden_tokens: vec![],
+        chat_only: false,
     });
 
     registry.register(Command {
@@ -1050,6 +1164,46 @@ mod tests {
         let mut registry = Registry::new();
         register_all_commands(&mut registry);
         registry
+    }
+
+    #[tokio::test]
+    async fn test_handle_btw_requires_question() {
+        let parsed = ParsedCommand {
+            name: "btw".to_string(),
+            args: vec![],
+            raw: "/btw".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+        let result = handle_btw(&parsed, &mut session_manager).await;
+        assert_eq!(
+            result,
+            CommandResult::Error("Usage: /btw <question>".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_btw_with_question_defers_to_app() {
+        let parsed = ParsedCommand {
+            name: "btw".to_string(),
+            args: vec!["also".to_string(), "check".to_string()],
+            raw: "/btw also check".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+        let result = handle_btw(&parsed, &mut session_manager).await;
+        // The app intercepts /btw (needs provider/model + side-channel turn).
+        assert_eq!(result, CommandResult::Success(String::new()));
+    }
+
+    #[test]
+    fn test_btw_registered_for_home_and_chat() {
+        let registry = create_registry();
+        let command = registry.get("btw").expect("/btw registered");
+        assert!(!registry.is_chat_only("btw"));
+        assert!(!command.description.is_empty());
     }
 
     #[tokio::test]
@@ -1320,6 +1474,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_models_warm_path_serves_snapshot() {
+        // Warm-cache first open: with a published snapshot, `/models` serves
+        // the snapshot rows. The ollama in-process cache is deliberately left
+        // empty here so any `ollama ls` subprocess spawn would surface as
+        // missing/slow runtime rows rather than snapshot content.
+        let _snapshot_lock = crate::model::effective_catalog::lock_snapshot_for_test();
+        let _stashed =
+            crate::model::effective_catalog::StashedSnapshot::stash().expect("stash snapshot");
+        let _ollama_guard = crate::model::extensions::ollama::test_cache_lock();
+        let _ = crate::persistence::AuthDAO::cleanup_test();
+        crate::model::extensions::ollama::clear_cache_for_test();
+
+        let marker = crate::model::types::Model {
+            id: "warm-marker-1".to_string(),
+            name: "Warm Marker 1".to_string(),
+            family: "test".to_string(),
+            provider_id: crate::model::extensions::ollama::PROVIDER_ID.to_string(),
+            provider_name: crate::model::extensions::ollama::PROVIDER_NAME.to_string(),
+            attachment: false,
+            structured_output: false,
+            free: false,
+            local: true,
+            reasoning_options: Vec::new(),
+        };
+        crate::model::effective_catalog::publish_refreshed_models(vec![marker])
+            .expect("publish warm snapshot");
+
+        let parsed = ParsedCommand {
+            name: "models".to_string(),
+            args: vec![],
+            raw: "/models".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+        let result = handle_models(&parsed, &mut session_manager).await;
+
+        match result {
+            CommandResult::ShowDialog { title, items } => {
+                assert_eq!(title, "Available Models");
+                assert!(
+                    items.iter().any(|item| item.id == "warm-marker-1"
+                        && item.provider_id == crate::model::extensions::ollama::PROVIDER_ID),
+                    "snapshot marker missing from warm dialog: {:?}",
+                    items
+                        .iter()
+                        .map(|item| (&item.provider_id, &item.id))
+                        .collect::<Vec<_>>()
+                );
+            }
+            other => panic!("Expected warm snapshot dialog, got {:?}", other),
+        }
+
+        let _ = crate::persistence::AuthDAO::cleanup_test();
+    }
+
+    #[tokio::test]
+    async fn test_load_models_cold_path_seeds_snapshot() {
+        // First-ever open (no snapshot): `/models` falls back to fetch plus
+        // runtime rows, then seeds a complete global snapshot via a clean
+        // `Discovery` (no custom, no enabled filtering) like `/refreshmodels`.
+        // The seeded snapshot must carry both persistent and runtime rows so
+        // the next open is warm; a runtime-only seed would poison the global
+        // file. The persistent cache file below makes the test deterministic
+        // offline (no models.dev network dependency).
+        let _snapshot_lock = crate::model::effective_catalog::lock_snapshot_for_test();
+        let _stashed =
+            crate::model::effective_catalog::StashedSnapshot::stash().expect("stash snapshot");
+        let _ollama_guard = crate::model::extensions::ollama::test_cache_lock();
+        let _ = crate::persistence::AuthDAO::cleanup_test();
+        let _ = crate::model::discovery::Discovery::cleanup_test();
+        // Seed the on-disk models.dev cache with one persistent text model so
+        // the clean seed fetch has persistent rows even without network.
+        {
+            use std::collections::HashMap;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let cache_path =
+                std::path::PathBuf::from("/tmp/crabcode_test_cache/models_dev_cache.json");
+            std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
+                .expect("create test cache dir");
+            let mut models = HashMap::new();
+            models.insert(
+                "persist-seed-1".to_string(),
+                serde_json::json!({
+                    "id": "persist-seed-1",
+                    "name": "Persist Seed 1",
+                    "family": "test",
+                    "attachment": false,
+                    "reasoning": false,
+                    "reasoning_options": [],
+                    "tool_call": true,
+                    "structured_output": false,
+                    "temperature": false,
+                    "knowledge": "",
+                    "release_date": "",
+                    "last_updated": "",
+                    "status": null,
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "open_weights": false,
+                    "cost": null,
+                    "limit": null,
+                    "provider": null,
+                }),
+            );
+            let mut providers = HashMap::new();
+            providers.insert(
+                "test-persistent".to_string(),
+                serde_json::json!({
+                    "id": "test-persistent",
+                    "name": "Test Persistent",
+                    "api": "",
+                    "doc": "",
+                    "env": [],
+                    "npm": "",
+                    "models": models,
+                }),
+            );
+            let entry = serde_json::json!({
+                "data": providers,
+                "timestamp": now,
+                "schema_version": 5,
+            });
+            std::fs::write(
+                &cache_path,
+                serde_json::to_string_pretty(&entry).expect("serialize test cache"),
+            )
+            .expect("write test cache");
+        }
+        crate::model::extensions::ollama::set_cached_models_for_test(vec![
+            crate::model::extensions::ollama::OllamaModel {
+                id: "seed-marker-1".to_string(),
+                name: "Seed Marker 1".to_string(),
+            },
+        ]);
+
+        let parsed = ParsedCommand {
+            name: "models".to_string(),
+            args: vec![],
+            raw: "/models".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+        let result = handle_models(&parsed, &mut session_manager).await;
+
+        match result {
+            CommandResult::ShowDialog { title, items } => {
+                assert_eq!(title, "Available Models");
+                assert!(
+                    items.iter().any(|item| item.id == "seed-marker-1"
+                        && item.provider_id == crate::model::extensions::ollama::PROVIDER_ID),
+                    "runtime marker missing from cold dialog: {:?}",
+                    items
+                        .iter()
+                        .map(|item| (&item.provider_id, &item.id))
+                        .collect::<Vec<_>>()
+                );
+            }
+            other => panic!("Expected cold dialog with runtime rows, got {:?}", other),
+        }
+
+        let seeded = crate::model::effective_catalog::models_for_dialog()
+            .expect("read seeded snapshot")
+            .expect("snapshot seeded on cold path");
+        assert!(
+            seeded.iter().any(|model| model.id == "seed-marker-1"
+                && model.provider_id == crate::model::extensions::ollama::PROVIDER_ID),
+            "seeded snapshot missing runtime rows: {:?}",
+            seeded
+                .iter()
+                .map(|model| (model.provider_id.clone(), model.id.clone()))
+                .collect::<Vec<_>>()
+        );
+        // The seed must be complete: persistent rows are present (not a
+        // runtime-only poison), and they come from the clean source without
+        // dialog-level custom overlays.
+        assert!(
+            seeded.iter().any(|model| model.id == "persist-seed-1"
+                && model.provider_id == "test-persistent"),
+            "seeded snapshot missing persistent rows: {:?}",
+            seeded
+                .iter()
+                .map(|model| (model.provider_id.clone(), model.id.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        crate::model::extensions::ollama::clear_cache_for_test();
+        let _ = crate::persistence::AuthDAO::cleanup_test();
+        let _ = crate::model::discovery::Discovery::cleanup_test();
+    }
+
+    #[tokio::test]
     async fn test_handle_models_with_filter() {
         let _ = crate::model::discovery::Discovery::cleanup_test();
         let parsed = ParsedCommand {
@@ -1369,7 +1718,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_refreshmodels() {
-        let _guard = crate::model::extensions::ollama::test_cache_lock();
+        // `/refreshmodels` publishes the snapshot file as a side effect; stash
+        // it so concurrent snapshot tests stay serialized.
+        let _snapshot_lock = crate::model::effective_catalog::lock_snapshot_for_test();
+        let _stashed =
+            crate::model::effective_catalog::StashedSnapshot::stash().expect("stash snapshot");
+        // The refresh also spawns the real `ollama ls`, which overwrites the
+        // shared in-memory ollama cache: hold its test lock so strict
+        // runtime assertions elsewhere never observe the clobbered rows.
+        // Lock order is snapshot-then-ollama everywhere to avoid deadlock.
+        let _ollama_guard = crate::model::extensions::ollama::test_cache_lock();
         let _ = crate::model::discovery::Discovery::cleanup_test();
         let parsed = ParsedCommand {
             name: "refreshmodels".to_string(),
@@ -1388,7 +1746,8 @@ mod tests {
     async fn test_registry_has_all_commands() {
         let registry = create_registry();
         let names = registry.get_command_names();
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 23);
+        assert!(names.contains(&"btw".to_string()));
         assert!(names.contains(&"exit".to_string()));
         assert!(names.contains(&"sessions".to_string()));
         assert!(names.contains(&"new".to_string()));
@@ -1407,8 +1766,11 @@ mod tests {
         assert!(names.contains(&"skills".to_string()));
         assert!(names.contains(&"mcp".to_string()));
         assert!(names.contains(&"title".to_string()));
+        assert!(names.contains(&"variants".to_string()));
+        assert!(names.contains(&"status".to_string()));
         assert!(registry.is_chat_only("compact"));
         assert!(registry.is_chat_only("fork"));
+        assert!(!registry.is_chat_only("btw"));
         assert!(registry.is_chat_only("move"));
         assert!(registry.is_chat_only("branch"));
         assert_eq!(registry.get("branch").unwrap().name, "fork");
@@ -1428,6 +1790,42 @@ mod tests {
         let mut session_manager = SessionManager::new();
         let result = registry.execute(&parsed, &mut session_manager).await;
         assert_eq!(result, CommandResult::Success("Exiting...".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_handle_variants() {
+        let registry = create_registry();
+        let parsed = ParsedCommand {
+            name: "variants".to_string(),
+            args: vec![],
+            raw: "/variants".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+
+        assert!(matches!(
+            registry.execute(&parsed, &mut session_manager).await,
+            CommandResult::Success(message) if message.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_status() {
+        let registry = create_registry();
+        let parsed = ParsedCommand {
+            name: "status".to_string(),
+            args: vec![],
+            raw: "/status".to_string(),
+            prefs_data: None,
+            active_model_id: None,
+        };
+        let mut session_manager = SessionManager::new();
+
+        assert!(matches!(
+            registry.execute(&parsed, &mut session_manager).await,
+            CommandResult::Success(message) if message.is_empty()
+        ));
     }
 
     #[tokio::test]

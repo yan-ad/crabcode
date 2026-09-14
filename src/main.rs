@@ -7,6 +7,7 @@ mod app;
 mod auth;
 mod autocomplete;
 mod command;
+mod completion;
 mod config;
 mod herdr;
 mod jobs;
@@ -18,18 +19,21 @@ mod model;
 mod notify;
 mod persistence;
 mod plugin;
+mod pr;
 mod prompt;
 mod remote;
 mod remote_mcp;
 mod session;
 mod skill;
 mod sound;
+mod stats;
 mod streaming;
 mod terminal_title;
 mod theme;
 mod toast;
 mod tools;
 mod ui;
+mod update;
 mod upgrade;
 mod utils;
 mod views;
@@ -70,7 +74,7 @@ use crate::toast::{Toast, ToastManager};
 use anyhow::{Context, Result};
 use app::App;
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, shells};
+use clap_complete::Shell;
 use ratatui::crossterm::{
     event::{
         self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -554,6 +558,7 @@ async fn run_print_mode(
             | crate::llm::ChunkMessage::Metrics { .. }
             | crate::llm::ChunkMessage::Cancelled
             | crate::llm::ChunkMessage::Reasoning(_)
+            | crate::llm::ChunkMessage::Usage(_)
             | crate::llm::ChunkMessage::Retry(_)
             | crate::llm::ChunkMessage::StreamRollback { .. }
             | crate::llm::ChunkMessage::SubagentStarted { .. }
@@ -686,13 +691,27 @@ pub fn remove_expired_toasts() {
     TOAST_MANAGER.lock().unwrap().remove_expired();
 }
 
+/// Drop expired toasts, reporting whether a redraw is needed. Separated from
+/// the void helper so the event loop can repaint exactly once at expiry
+/// without continuously animating.
+fn remove_expired_toasts_needs_redraw() -> bool {
+    TOAST_MANAGER.lock().unwrap().remove_expired()
+}
+
+/// How long until the next toast expires (for idle wakeup). Caps the idle
+/// `poll()` so a 4s toast wakes one redraw at expiry instead of lingering
+/// painted with a dead hitbox.
+fn time_until_next_toast_expiry() -> Option<std::time::Duration> {
+    TOAST_MANAGER.lock().unwrap().time_until_next_expiry()
+}
+
 pub fn get_toast_manager() -> &'static Mutex<ToastManager> {
     &TOAST_MANAGER
 }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
+pub(crate) struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -753,8 +772,15 @@ enum Command {
         cwd: Option<PathBuf>,
     },
 
-    /// Generate shell completion script
-    Completion,
+    /// Generate or install shell completions
+    Completion {
+        /// Target shell. Defaults from `$SHELL`.
+        #[arg(value_enum)]
+        shell: Option<Shell>,
+        /// Write the script where the shell autoloads it
+        #[arg(long)]
+        install: bool,
+    },
 
     /// Host the current workspace for browser and CLI clients
     Serve {
@@ -787,6 +813,31 @@ enum Command {
     Upgrade {
         /// Target version (e.g. `0.0.12`) or `latest`
         target: Option<String>,
+    },
+
+    /// Fetch and checkout a GitHub PR branch, then run crabcode
+    Pr {
+        /// PR number to checkout
+        number: u64,
+    },
+
+    /// Show token usage and cost statistics
+    Stats {
+        /// Show stats for the last N days (default: all time)
+        #[arg(long)]
+        days: Option<u64>,
+
+        /// Number of tools to show (default: all)
+        #[arg(long)]
+        tools: Option<usize>,
+
+        /// Show model statistics; optionally limit to the top N
+        #[arg(long, num_args = 0..=1, default_missing_value = "all")]
+        models: Option<String>,
+
+        /// Filter by project (default: all projects, empty string: current project)
+        #[arg(long, value_name = "PROJECT", num_args = 0..=1, default_missing_value = "")]
+        project: Option<String>,
     },
 
     /// Manage survive-quit background jobs (list / logs / stop)
@@ -896,35 +947,11 @@ enum MaintenanceCommand {
     List,
 }
 
-fn is_completion_help(args: &[String]) -> bool {
-    matches!(args, [command, help] if command == "completion" && matches!(help.as_str(), "--help" | "-h"))
-}
-
-fn completion_shell(shell: Option<&str>) -> shells::Shell {
-    match shell.and_then(|shell| shell.rsplit('/').next()) {
-        Some("zsh") => shells::Shell::Zsh,
-        _ => shells::Shell::Bash,
-    }
-}
-
-fn generate_completion(shell: shells::Shell) -> Vec<u8> {
-    let mut command = Args::command();
-    let mut output = Vec::new();
-    generate(shell, &mut command, "crabcode", &mut output);
-    output
-}
-
 fn root_help() -> Result<String> {
     let mut command = Args::command();
     let mut output = Vec::new();
     command.write_long_help(&mut output)?;
     Ok(String::from_utf8(output).expect("Clap help is valid UTF-8"))
-}
-
-fn print_completion() -> Result<()> {
-    let shell = completion_shell(std::env::var("SHELL").ok().as_deref());
-    io::stdout().write_all(&generate_completion(shell))?;
-    Ok(())
 }
 
 fn merge_prompt_with_stdin(prompt: &str, stdin: &str) -> String {
@@ -975,12 +1002,6 @@ fn launch_remote_serve(request: app::RemoteLaunchRequest) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if is_completion_help(&raw_args) {
-        println!("{}", root_help()?);
-        return Ok(());
-    }
-
     let args = Args::parse();
     crate::logging::set_enabled(args.emit_logs);
     crate::aisdk::log::set_logger(|msg| {
@@ -1011,8 +1032,11 @@ async fn main() -> Result<()> {
         Some(Command::Acp { cwd }) => {
             return crate::acp::run(cwd.clone()).await;
         }
-        Some(Command::Completion) => {
-            print_completion()?;
+        Some(Command::Completion { shell, install }) => {
+            crate::completion::run(
+                shell.unwrap_or_else(crate::completion::default_shell),
+                *install,
+            )?;
             return Ok(());
         }
         Some(Command::Serve { bind, pair_code }) => {
@@ -1036,6 +1060,35 @@ async fn main() -> Result<()> {
         }
         Some(Command::Upgrade { target }) => {
             return crate::upgrade::upgrade(target.as_deref());
+        }
+        Some(Command::Pr { number }) => {
+            return crate::pr::run(*number);
+        }
+        Some(Command::Stats {
+            days,
+            tools,
+            models,
+            project,
+        }) => {
+            let models = models
+                .as_deref()
+                .map(|value| {
+                    if value == "all" {
+                        Ok(None)
+                    } else {
+                        value
+                            .parse::<usize>()
+                            .map(Some)
+                            .context("--models must be a non-negative integer")
+                    }
+                })
+                .transpose()?;
+            return crate::stats::run(crate::stats::StatsOptions {
+                days: *days,
+                tools: *tools,
+                models,
+                project: project.clone(),
+            });
         }
         Some(Command::Jobs { command }) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1370,10 +1423,49 @@ mod tests {
     }
 
     #[test]
-    fn generates_bash_completion() {
-        let script =
-            String::from_utf8(generate_completion(completion_shell(Some("/bin/bash")))).unwrap();
+    fn parses_stats_command_and_compatible_options() {
+        let args = Args::try_parse_from([
+            "crabcode",
+            "stats",
+            "--days",
+            "7",
+            "--tools",
+            "5",
+            "--models",
+            "3",
+            "--project",
+            "",
+        ])
+        .unwrap();
 
+        match args.command {
+            Some(Command::Stats {
+                days,
+                tools,
+                models,
+                project,
+            }) => {
+                assert_eq!(days, Some(7));
+                assert_eq!(tools, Some(5));
+                assert_eq!(models.as_deref(), Some("3"));
+                assert_eq!(project.as_deref(), Some(""));
+            }
+            other => panic!("expected stats command, got {other:?}"),
+        }
+
+        let args = Args::try_parse_from(["crabcode", "stats", "--models"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Stats {
+                models: Some(ref models),
+                ..
+            }) if models == "all"
+        ));
+    }
+
+    #[test]
+    fn generates_bash_completion() {
+        let script = String::from_utf8(crate::completion::generate_script(Shell::Bash)).unwrap();
         assert!(script.contains("_crabcode"));
         assert!(script.contains("complete"));
         assert!(script.contains("crabcode"));
@@ -1381,32 +1473,45 @@ mod tests {
 
     #[test]
     fn generates_zsh_completion() {
-        let script =
-            String::from_utf8(generate_completion(completion_shell(Some("/bin/zsh")))).unwrap();
-
+        let script = String::from_utf8(crate::completion::generate_script(Shell::Zsh)).unwrap();
         assert!(script.starts_with("#compdef crabcode"));
         assert!(script.contains("_crabcode"));
     }
 
     #[test]
-    fn completion_help_uses_root_help() {
-        assert!(is_completion_help(&[
-            "completion".to_string(),
-            "--help".to_string()
-        ]));
-        assert!(is_completion_help(&[
-            "completion".to_string(),
-            "-h".to_string()
-        ]));
-        assert!(!is_completion_help(&["completion".to_string()]));
-        assert!(!is_completion_help(&[
-            "serve".to_string(),
-            "--help".to_string()
-        ]));
+    fn parses_completion_shell_and_install() {
+        let args = Args::try_parse_from(["crabcode", "completion", "zsh", "--install"]).unwrap();
+        match args.command {
+            Some(Command::Completion { shell, install }) => {
+                assert_eq!(shell, Some(Shell::Zsh));
+                assert!(install);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
 
+    #[test]
+    fn parses_completion_without_shell() {
+        let args = Args::try_parse_from(["crabcode", "completion"]).unwrap();
+        match args.command {
+            Some(Command::Completion { shell, install }) => {
+                assert_eq!(shell, None);
+                assert!(!install);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_help_lists_completion() {
         let help = root_help().unwrap();
         assert!(help.contains("Usage: crabcode"));
-        assert!(help.contains("completion   Generate shell completion script"));
+        assert!(help.contains("completion"));
+        assert!(help.contains("Generate or install shell completions"));
+        assert!(help.contains("stats"));
+        assert!(help.contains("Show token usage and cost statistics"));
+        assert!(help.contains("pr"));
+        assert!(help.contains("Fetch and checkout a GitHub PR branch, then run crabcode"));
         assert!(
             help.contains("serve        Host the current workspace for browser and CLI clients")
         );
@@ -1451,6 +1556,16 @@ mod tests {
         match args.command {
             Some(Command::Upgrade { target }) => assert_eq!(target.as_deref(), Some("0.1.0")),
             other => panic!("expected upgrade command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_command() {
+        let args = Args::try_parse_from(["crabcode", "pr", "123"]).unwrap();
+
+        match args.command {
+            Some(Command::Pr { number }) => assert_eq!(number, 123),
+            other => panic!("expected pr command, got {other:?}"),
         }
     }
 
@@ -1557,23 +1672,62 @@ async fn run_event_loop(
     // A short "idle" poll still burns needless redraws/sec; block until input instead.
     const FAST_POLL: Duration = Duration::from_millis(16); // ~60fps for interactive animations
     const STREAMING_POLL: Duration = Duration::from_millis(40); // 25fps, matches wave spinner
-    const IDLE_POLL: Duration = Duration::from_secs(30); // wake only on input / timeout
+                                                                // Background update/upgrade completion poll: wakes to drain the channel
+                                                                // without rendering (10Hz, no frames). Far cheaper than pinning 60fps
+                                                                // full renders for a 10s lookup or minutes-long install.
+    const BACKGROUND_POLL: Duration = Duration::from_millis(100);
+    // Discover cross-terminal job changes without forcing animation/redraws.
+    const IDLE_POLL: Duration = Duration::from_secs(1);
 
     let mut needs_redraw = true;
+    let mut first_frame_painted = false;
     let mut last_complete_frame: Option<Buffer> = None;
     let mut last_full_render_at = std::time::Instant::now();
+    let mut jobs_refresh: Option<tokio::task::JoinHandle<()>> = None;
+    let mut last_jobs_refresh = None::<std::time::Instant>;
+    let mut displayed_jobs_count = app.process_registry.running_count();
 
     while app.running {
         let loop_start = std::time::Instant::now();
 
-        let animation_needed = app.is_animation_running();
+        if jobs_refresh.as_ref().is_some_and(|task| task.is_finished()) {
+            jobs_refresh.take();
+        }
+        // First paint must not compete with spawning a worker or reading the ledger.
+        if first_frame_painted
+            && jobs_refresh.is_none()
+            && last_jobs_refresh.is_none_or(|last| last.elapsed() >= IDLE_POLL)
+        {
+            let registry = app.process_registry.clone();
+            jobs_refresh = Some(tokio::task::spawn_blocking(move || {
+                registry.refresh_running_jobs();
+            }));
+            last_jobs_refresh = Some(std::time::Instant::now());
+        }
+        let jobs_count = app.process_registry.running_count();
+        if jobs_count != displayed_jobs_count {
+            displayed_jobs_count = jobs_count;
+            needs_redraw = true;
+        }
 
-        let poll_duration = if animation_needed && app.is_streaming_animation_only() {
+        let animation_needed = app.is_animation_running();
+        let background_pending = app.has_pending_update_work();
+
+        let base_poll = if animation_needed && app.is_streaming_animation_only() {
             STREAMING_POLL
         } else if animation_needed {
             FAST_POLL
+        } else if background_pending {
+            BACKGROUND_POLL
         } else {
             IDLE_POLL
+        };
+        // Cap idle/background waits at the next toast expiry so a 4s toast
+        // wakes exactly one redraw at expiry (no stale paint + dead hitbox,
+        // no continuous animation).
+        let poll_duration = match time_until_next_toast_expiry() {
+            Some(until_expiry) => base_poll.min(until_expiry),
+            None => base_poll,
         };
 
         let elapsed_before_poll = loop_start.elapsed();
@@ -1593,6 +1747,19 @@ async fn run_event_loop(
             if std::env::var_os("CRABCODE_MOUSE_TRACE").is_some() {
                 if let event::Event::Mouse(mouse) = &event {
                     crate::emit_log!("Mouse event: {:?}", mouse);
+                }
+            }
+
+            // Opt-in raw key trace: CRABCODE_KEY_TRACE=1 shows every key
+            // event as a toast (useful to see what a terminal actually
+            // sends for combos like Cmd+Shift+Left).
+            if std::env::var_os("CRABCODE_KEY_TRACE").is_some() {
+                if let event::Event::Key(key) = &event {
+                    push_toast(Toast::new(
+                        format!("Key: {:?}", key),
+                        crate::toast::ToastLevel::Info,
+                        None,
+                    ));
                 }
             }
 
@@ -1618,6 +1785,15 @@ async fn run_event_loop(
                                         if next_mouse.kind == last_scroll.kind {
                                             scroll_count = scroll_count.saturating_add(1);
                                         } else {
+                                            // Flush before switching direction: dropping
+                                            // the accumulated ticks would eat the
+                                            // dominant gesture and let a stray
+                                            // opposite tick move the viewport the
+                                            // wrong way.
+                                            app.handle_coalesced_mouse_scroll(
+                                                last_scroll,
+                                                scroll_count,
+                                            );
                                             last_scroll = next_mouse;
                                             scroll_count = 1;
                                         }
@@ -1710,10 +1886,18 @@ async fn run_event_loop(
             needs_redraw = true;
         }
 
-        app.process_streaming_chunks();
+        // Background update/upgrade completion lands a toast: redraw once even
+        // when idle (no animation/input to carry the repaint).
+        if app.process_streaming_chunks() {
+            needs_redraw = true;
+        }
         app.update_animations();
         app.update_terminal_title_signal();
-        remove_expired_toasts();
+        // Toast expiry also needs exactly one redraw: without it the last
+        // frame stays painted while hit-testing already reports expired.
+        if remove_expired_toasts_needs_redraw() {
+            needs_redraw = true;
+        }
         let isolated_spinner_interval = app.isolated_subagent_spinner_interval();
         let full_render_due = isolated_spinner_interval.is_none_or(|interval| {
             last_complete_frame.is_none() || last_full_render_at.elapsed() >= interval
@@ -1751,6 +1935,7 @@ async fn run_event_loop(
                 last_full_render_at = std::time::Instant::now();
             }
             needs_redraw = false;
+            first_frame_painted = true;
 
             // Hydrate config/prefs/themes/skills, then session index, after first paint.
             if !startup_hydrated {
@@ -1763,6 +1948,8 @@ async fn run_event_loop(
                 session_history_loaded = true;
                 needs_redraw = true;
             }
+            // Lazy nonblocking update check (24h cache, silent failures).
+            app.maybe_start_update_check();
         }
     }
     Ok(())

@@ -25,6 +25,35 @@ const SEARCH_AREA_HEIGHT: u16 = 2;
 const PROVIDER_EXACT_MATCH_BOOST: u32 = 1_000_000;
 const PROVIDER_PREFIX_MATCH_BOOST: u32 = 900_000;
 
+/// Dim everything outside `dialog_area` to mimic a semi-transparent
+/// backdrop (cf. opencode `RGBA(0,0,0,150)`, ~59% toward black).
+/// Terminals have no alpha channel, so each cell's `Rgb` background
+/// (~40% kept) and foreground (~50% kept) are scaled toward black and
+/// `DIM` is set. `Reset` channels are left alone so transparent mode
+/// keeps showing the terminal through.
+pub fn dim_backdrop(frame: &mut Frame, area: Rect, dialog_area: Rect) {
+    use ratatui::layout::Position;
+    fn scale(v: u8, num: u16, den: u16) -> u8 {
+        ((v as u16 * num) / den).min(255) as u8
+    }
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if dialog_area.contains(Position::new(x, y)) {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if let Color::Rgb(r, g, b) = cell.bg {
+                    cell.bg = Color::Rgb(scale(r, 2, 5), scale(g, 2, 5), scale(b, 2, 5));
+                }
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    cell.fg = Color::Rgb(scale(r, 1, 2), scale(g, 1, 2), scale(b, 1, 2));
+                }
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterSelectionMode {
     Preserve,
@@ -90,6 +119,8 @@ pub struct Dialog {
     pub actions: Vec<DialogAction>,
     bottom_gap_height: u16,
     pub position: DialogPosition,
+    max_height: Option<u16>,
+    search_visible: bool,
     pub pending_delete_id: Option<String>,
     collapsible_groups: bool,
     collapsed_groups: HashSet<String>,
@@ -128,6 +159,8 @@ impl Dialog {
             actions: Vec::new(),
             bottom_gap_height: 1,
             position: DialogPosition::Center,
+            max_height: None,
+            search_visible: true,
             pending_delete_id: None,
             collapsible_groups: false,
             collapsed_groups: HashSet::new(),
@@ -141,6 +174,27 @@ impl Dialog {
     pub fn with_position(mut self, position: DialogPosition) -> Self {
         self.position = position;
         self
+    }
+
+    pub fn with_max_height(mut self, height: u16) -> Self {
+        self.max_height = Some(height.max(1));
+        self
+    }
+
+    pub fn with_search_visible(mut self, visible: bool) -> Self {
+        self.search_visible = visible;
+        if !visible {
+            self.search_query.clear();
+        }
+        self
+    }
+
+    fn search_area_height(&self) -> u16 {
+        if self.search_visible {
+            SEARCH_AREA_HEIGHT
+        } else {
+            0
+        }
     }
 
     pub fn with_collapsible_groups(mut self, enabled: bool) -> Self {
@@ -219,10 +273,13 @@ impl Dialog {
         }
 
         self.visible_row_count = visible_row_count;
-        self.scroll_offset = scroll_offset;
         self.set_collapsed_groups(collapsed_groups);
         self.is_dragging_scrollbar = was_dragging;
         self.scrollbar_drag_offset = drag_offset;
+        // Restore the saved viewport last: set_collapsed_groups reconciles
+        // selection (adjust_scroll), which would otherwise yank a
+        // wheel-scrolled viewport back to the selected row on every refresh.
+        self.scroll_offset = scroll_offset;
         self.update_scrollbar();
     }
 
@@ -969,14 +1026,15 @@ impl Dialog {
 
             let footer_height = self.footer_height();
             let total_fixed_height =
-                1 + 1 + SEARCH_AREA_HEIGHT + self.bottom_gap_height + footer_height;
+                1 + 1 + self.search_area_height() + self.bottom_gap_height + footer_height;
             let (_, padding_y) = self.content_padding();
             let padding_total = padding_y * 2;
 
             match self.position {
                 DialogPosition::Center => {
+                    let dialog_height = self.max_height.unwrap_or(DIALOG_HEIGHT_CENTER);
                     let list_area_height =
-                        DIALOG_HEIGHT_CENTER.saturating_sub(total_fixed_height + padding_total);
+                        dialog_height.saturating_sub(total_fixed_height + padding_total);
                     list_area_height as usize
                 }
                 DialogPosition::Left | DialogPosition::Right => {
@@ -1066,7 +1124,7 @@ impl Dialog {
         [
             ratatui::layout::Constraint::Length(1),
             ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(SEARCH_AREA_HEIGHT),
+            ratatui::layout::Constraint::Length(self.search_area_height()),
             ratatui::layout::Constraint::Min(0),
             ratatui::layout::Constraint::Length(self.bottom_gap_height),
             ratatui::layout::Constraint::Length(self.footer_height()),
@@ -1128,7 +1186,10 @@ impl Dialog {
                     Span::styled(name, Style::default().fg(colors.primary)),
                 ]
             } else {
-                vec![Span::raw(format!("{indicator}{name}"))]
+                vec![Span::styled(
+                    format!("{indicator}{name}"),
+                    Style::default().fg(colors.text),
+                )]
             };
             return (spans, text_width);
         }
@@ -1144,7 +1205,10 @@ impl Dialog {
                     Span::styled(name, Style::default().fg(colors.primary)),
                 ]
             } else {
-                vec![Span::raw(format!("{indicator}{name}"))]
+                vec![Span::styled(
+                    format!("{indicator}{name}"),
+                    Style::default().fg(colors.text),
+                )]
             };
             return (spans, text_width);
         }
@@ -1162,7 +1226,10 @@ impl Dialog {
                 Style::default().fg(colors.primary),
             ));
         } else {
-            spans.push(Span::raw(format!("{indicator}{name_prefix}")));
+            spans.push(Span::styled(
+                format!("{indicator}{name_prefix}"),
+                Style::default().fg(colors.text),
+            ));
         }
         spans.push(Span::styled(
             description,
@@ -1255,6 +1322,7 @@ impl Dialog {
             }
             KeyCode::Char('j') if event.modifiers == KeyModifiers::CONTROL => true,
             KeyCode::Char('c') if event.modifiers == KeyModifiers::CONTROL => false,
+            _ if !self.search_visible => false,
             _ => {
                 let previous_query = self.search_query.clone();
                 input_textarea(&mut self.search_textarea, event);
@@ -1585,7 +1653,9 @@ impl Dialog {
         match self.position {
             DialogPosition::Center => {
                 let dialog_width = area.width.min(DIALOG_WIDTH_CENTER);
-                let dialog_height = area.height.min(DIALOG_HEIGHT_CENTER);
+                let dialog_height = area
+                    .height
+                    .min(self.max_height.unwrap_or(DIALOG_HEIGHT_CENTER));
 
                 self.dialog_area = Rect {
                     x: (area.width - dialog_width) / 2,
@@ -1616,6 +1686,7 @@ impl Dialog {
             }
         }
 
+        dim_backdrop(frame, area, self.dialog_area);
         frame.render_widget(Clear, self.dialog_area);
 
         self.content_area = self.padded_content_area();
@@ -1659,7 +1730,26 @@ impl Dialog {
         .alignment(ratatui::layout::Alignment::Right);
         frame.render_widget(esc_paragraph, header_chunks[1]);
 
-        frame.render_widget(&self.search_textarea, chunks[2]);
+        if self.search_visible {
+            self.search_textarea.set_style(
+                Style::default()
+                    .fg(colors.text)
+                    .bg(colors.dialog_background),
+            );
+            self.search_textarea
+                .set_placeholder_style(Style::default().fg(colors.text_weak));
+            // Single caret: hardware cursor (place_terminal_cursor) is the
+            // source of truth. Fake block suppressed so complex emoji
+            // (ZWJ, VS16, flags) can't show as two split carets.
+            self.search_textarea.set_cursor_style(
+                Style::default()
+                    .fg(colors.text)
+                    .bg(colors.dialog_background),
+            );
+            self.search_textarea
+                .set_selection_style(Style::default().fg(colors.text).bg(colors.border_focus));
+            frame.render_widget(&self.search_textarea, chunks[2]);
+        }
 
         let mut content_lines = Vec::new();
         let list_area_width = chunks[3].width.saturating_sub(2); // Subtract scrollbar width
@@ -1802,6 +1892,40 @@ impl Dialog {
         let footer_paragraph = Paragraph::new(self.footer_lines(chunks[5].width, colors))
             .alignment(ratatui::layout::Alignment::Left);
         frame.render_widget(footer_paragraph, chunks[5]);
+
+        self.place_terminal_cursor(frame, &chunks, &list_content_area);
+    }
+
+    /// Move the hardware terminal cursor into the dialog so terminal-level
+    /// cursor effects (e.g. ghostty cursor shaders) follow dialog focus
+    /// instead of staying stuck on the chat input behind the dialog.
+    ///
+    /// Typing always goes to the search box, so the cursor lives there —
+    /// even with an empty query. Dialogs without a search box (e.g.
+    /// /variants) set no cursor, letting ratatui hide it instead of
+    /// jumpily tracking list selection.
+    fn place_terminal_cursor(&self, frame: &mut Frame, chunks: &[Rect], _list_content_area: &Rect) {
+        if chunks.len() < 4 {
+            return;
+        }
+        if self.search_visible {
+            let search_area = chunks[2];
+            if search_area.width == 0 || search_area.height == 0 {
+                return;
+            }
+            let (cursor_row, cursor_col) = self.search_textarea.cursor();
+            let cursor_col = cursor_col.min(usize::MAX >> 1);
+            let line = self
+                .search_textarea
+                .lines()
+                .get(cursor_row)
+                .cloned()
+                .unwrap_or_default();
+            let prefix: String = line.chars().take(cursor_col).collect();
+            let x_offset = (prefix.width() as u16).min(search_area.width.saturating_sub(1));
+            let y_offset = (cursor_row as u16).min(search_area.height.saturating_sub(1));
+            frame.set_cursor_position((search_area.x + x_offset, search_area.y + y_offset));
+        }
     }
 
     pub fn footer_lines(&self, width: u16, colors: ThemeColors) -> Vec<Line<'static>> {
@@ -1886,6 +2010,8 @@ impl Clone for Dialog {
             actions: self.actions.clone(),
             bottom_gap_height: self.bottom_gap_height,
             position: self.position,
+            max_height: self.max_height,
+            search_visible: self.search_visible,
             pending_delete_id: self.pending_delete_id.clone(),
             collapsible_groups: self.collapsible_groups,
             collapsed_groups: self.collapsed_groups.clone(),
