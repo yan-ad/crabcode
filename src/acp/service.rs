@@ -30,6 +30,18 @@ pub struct AcpService {
     client_capabilities: Arc<Mutex<agent_client_protocol::schema::v1::ClientCapabilities>>,
 }
 
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(
+            "always",
+            "Always allow for this session",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+    ]
+}
+
 fn model_output_limit(config: &LoadedConfig, provider_id: &str, model_id: &str) -> Option<u32> {
     if let Some(limit) = config
         .merged_config
@@ -753,6 +765,7 @@ fn merge_acp_mcp_servers(config: &mut LoadedConfig, servers: Vec<McpServer>) {
 struct AcpSession {
     cwd: PathBuf,
     config: LoadedConfig,
+    tool_permissions: crate::tools::ToolPermissions,
     skills: crate::skill::SkillStore,
     models: Vec<crate::model::types::Model>,
     provider: String,
@@ -851,11 +864,13 @@ impl AcpService {
         };
 
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
+        let tool_permissions = configured_tool_permissions(&cwd, &config);
         self.sessions.lock().await.insert(
             session_id.clone(),
             AcpSession {
                 cwd,
                 config,
+                tool_permissions,
                 skills,
                 models,
                 provider,
@@ -970,10 +985,13 @@ impl AcpService {
             }
             fork_id
         };
-        self.sessions
-            .lock()
-            .await
-            .insert(fork_id.clone(), source.clone());
+        self.sessions.lock().await.insert(
+            fork_id.clone(),
+            AcpSession {
+                tool_permissions: configured_tool_permissions(&source.cwd, &source.config),
+                ..source.clone()
+            },
+        );
         Ok(NewSessionResponse::new(fork_id)
             .modes(session_modes(&source))
             .config_options(session_config_options(&source)))
@@ -1125,9 +1143,11 @@ impl AcpService {
             reasoning.unwrap_or(crate::model::reasoning::ReasoningEffort::None);
         let context_window = model_context_window(&config, &models, &provider, &model);
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
+        let tool_permissions = configured_tool_permissions(&cwd, &config);
         let session = AcpSession {
             cwd,
             config,
+            tool_permissions,
             skills,
             models,
             provider,
@@ -1918,26 +1938,19 @@ fn resolve_model(config: &LoadedConfig) -> (String, String) {
         .unwrap_or_else(|| ("opencode".to_string(), "big-pickle".to_string()))
 }
 
-fn tool_permissions(session: &AcpSession) -> crate::tools::ToolPermissions {
+fn configured_tool_permissions(cwd: &Path, config: &LoadedConfig) -> crate::tools::ToolPermissions {
     let mut policies = crate::tools::AgentToolPolicies::default();
-    for (mode, tools) in session
-        .config
-        .merged_config
-        .agent_registry
-        .tool_policy_map()
-    {
+    for (mode, tools) in config.merged_config.agent_registry.tool_policy_map() {
         policies = policies.with_custom_tools(mode, tools);
     }
-    crate::tools::ToolPermissions::new(&session.cwd)
+    crate::tools::ToolPermissions::new(cwd)
         .with_agent_policies(policies)
-        .with_permission_rules(session.config.merged_config.permission_rules.clone())
-        .with_agent_permission_rules(
-            session
-                .config
-                .merged_config
-                .agent_registry
-                .permission_rules_map(),
-        )
+        .with_permission_rules(config.merged_config.permission_rules.clone())
+        .with_agent_permission_rules(config.merged_config.agent_registry.permission_rules_map())
+}
+
+fn tool_permissions(session: &AcpSession) -> crate::tools::ToolPermissions {
+    session.tool_permissions.clone()
 }
 
 fn session_modes(session: &AcpSession) -> SessionModeState {
@@ -2508,15 +2521,8 @@ async fn request_permission(
         }
         fields
     });
-    let request = RequestPermissionRequest::new(
-        session_id.to_string(),
-        tool_call,
-        vec![
-            PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce),
-            PermissionOption::new("always", "Always allow", PermissionOptionKind::AllowAlways),
-            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
-        ],
-    );
+    let request =
+        RequestPermissionRequest::new(session_id.to_string(), tool_call, permission_options());
     let Ok(response) = connection.send_request(request).block_task().await else {
         return crate::tools::PermissionResponse::Deny;
     };
@@ -3159,6 +3165,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 xdg_config_home: PathBuf::from("/tmp"),
             },
+            tool_permissions: crate::tools::ToolPermissions::new("/tmp"),
             skills: crate::skill::SkillStore::load(Path::new("/tmp"), Path::new("/tmp")),
             models: vec![model("example", "Example", "chat", "Chat")],
             provider: "example".to_string(),
@@ -3440,6 +3447,60 @@ mod tests {
     #[test]
     fn acp_permission_generates_fallback_id_without_origin() {
         assert!(permission_tool_call_id(None).starts_with("permission:"));
+    }
+
+    #[test]
+    fn acp_permission_offers_explicit_session_wide_allow() {
+        let options = permission_options();
+        let always = options
+            .iter()
+            .find(|option| option.option_id.to_string() == "always")
+            .expect("always option");
+        assert_eq!(always.name, "Always allow for this session");
+        assert_eq!(always.kind, PermissionOptionKind::AllowAlways);
+    }
+
+    #[tokio::test]
+    async fn acp_session_reuses_permission_grants_across_turns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&external).expect("external");
+
+        let mut session = test_session();
+        session.cwd = workspace.clone();
+        session.tool_permissions = crate::tools::ToolPermissions::new(&workspace);
+        let first_turn = tool_permissions(&session);
+        let second_turn = tool_permissions(&session);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let params = serde_json::json!({ "file_path": external.join("one.txt") });
+
+        let pending = tokio::spawn({
+            let permissions = first_turn.clone();
+            let params = params.clone();
+            let tx = tx.clone();
+            async move {
+                permissions
+                    .preflight("build", "read", &params, Some(&tx))
+                    .await
+            }
+        });
+        let prompt = match rx.recv().await {
+            Some(crate::llm::ChunkMessage::PermissionRequest(prompt)) => prompt,
+            _ => panic!("expected permission request"),
+        };
+        let _ = prompt
+            .response_tx
+            .send(crate::tools::PermissionResponse::AllowAlways);
+        assert!(pending.await.expect("permission task").is_ok());
+
+        let next_params = serde_json::json!({ "file_path": external.join("nested/two.txt") });
+        assert!(second_turn
+            .preflight("build", "read", &next_params, Some(&tx))
+            .await
+            .is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -3906,6 +3967,7 @@ mod tests {
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
         AcpSession {
             cwd: config.cwd.clone(),
+            tool_permissions: configured_tool_permissions(&config.cwd, &config),
             config,
             skills,
             models: Vec::new(),
