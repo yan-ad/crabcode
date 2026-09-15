@@ -137,6 +137,38 @@ fn initialize_over_stdio_and_shutdown_on_eof() {
 }
 
 #[test]
+fn session_load_error_keeps_stdio_transport_open() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut process = AcpProcess::spawn(workspace.path());
+    initialize(&mut process);
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/load",
+        "params": {
+            "sessionId": "missing-session",
+            "cwd": workspace.path(),
+            "mcpServers": []
+        }
+    }));
+    let (load_response, _) = process.recv_response(2);
+    assert_eq!(load_response["error"]["code"], -32602);
+    assert_eq!(load_response["error"]["data"], "unknown session");
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/list",
+        "params": {}
+    }));
+    let (list_response, _) = process.recv_response(3);
+    assert_eq!(list_response["result"]["sessions"], serde_json::json!([]));
+
+    process.close_and_wait();
+}
+
+#[test]
 fn advertises_and_dispatches_commands_over_stdio() {
     let workspace = tempfile::tempdir().expect("workspace");
     let command_dir = workspace.path().join(".crabcode/commands");

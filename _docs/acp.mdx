@@ -44,7 +44,7 @@ All Crabcode-side capabilities in this matrix are implemented. Conditions in the
 
 | Area | Full behavior | Status | Runtime or protocol requirements |
 | --- | --- | --- | --- |
-| Transport | JSON-RPC over stdio through `crabcode acp`, protocol-only stdout, clean stdin EOF shutdown, and subprocess coverage for initialize, session creation, command advertisement, and command dispatch. | Full | The subprocess wrapper must not write banners or logs to stdout. |
+| Transport | JSON-RPC over stdio through `crabcode acp`, protocol-only stdout, clean stdin EOF shutdown, request failures returned as JSON-RPC errors without closing the connection, and subprocess coverage for initialize, session loading failures, session creation, command advertisement, and command dispatch. | Full | The subprocess wrapper must not write banners or logs to stdout. |
 | Sessions | Create, cursor-list, load, resume, close, delete, and fork all persisted sessions, including child sessions. Lists include Crabcode parent/root IDs in ACP `_meta`; forks preserve the source title, regenerate message IDs, copy attachments independently, and publish commands for the new session. Delete removes persisted history and managed attachments. | Full | ACP has no standard nested-session tree field, so hierarchy is exposed through the `crabcode` metadata extension while the standard list remains flat. |
 | Prompts | Text, embedded resources, PNG/JPEG/GIF/WebP images, and WAV/MP3 audio; assistant text and reasoning stream back to the editor. Attachments use private per-session storage, survive load/resume, copy independently on fork, delete with persisted sessions, and readable legacy paths migrate automatically on load. | Full | The selected model route must advertise the matching input modality. Audio uses verified OpenAI-compatible Chat Completions `input_audio`; unsupported provider transports return a clear error instead of dropping media. |
 | Modes and models | Visible primary agents, selectable model catalog entries, and supported reasoning-effort values are session-local ACP configuration options. | Full | Available reasoning values follow the selected model's catalog capability. |
@@ -66,7 +66,7 @@ All Crabcode-side capabilities in this matrix are implemented. Conditions in the
 
 ## Session behavior
 
-`session/close` detaches the editor and cancels any active turn. It does not delete Crabcode session history. `session/delete` removes persisted history and managed attachments. List cursors page through the complete non-archived result set. Load replays the stored transcript; resume restores the session configuration without replaying prior content. Fork creates a new persisted session with a copied transcript and independently managed attachments. Child sessions are listed as normal entries with hierarchy metadata under `_meta.crabcode`.
+`session/close` detaches the editor and cancels any active turn. It does not delete Crabcode session history. `session/delete` removes persisted history and managed attachments. List cursors page through the complete non-archived result set. Load replays the stored transcript; resume restores the session configuration without replaying prior content. Fork creates a new persisted session with a copied transcript and independently managed attachments. Child sessions are listed as normal entries with hierarchy metadata under `_meta.crabcode`. Invalid or failed session operations return a normal JSON-RPC error response and leave the ACP stdio connection available for later requests.
 
 ## Safety notes
 

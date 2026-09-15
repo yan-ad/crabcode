@@ -67,20 +67,30 @@ pub async fn run(cwd: Option<PathBuf>) -> Result<()> {
                     let service = service.clone();
                     let task_connection = connection.clone();
                     connection.spawn(async move {
-                        let response = service
-                            .fork_session(request.session_id.to_string(), request.cwd)
-                            .await?;
-                        let session_id = response.session_id.clone();
-                        let commands = service.available_commands(&session_id.to_string()).await?;
-                        responder.respond(
-                            ForkSessionResponse::new(session_id.clone())
-                                .modes(response.modes)
-                                .config_options(response.config_options),
-                        )?;
-                        task_connection.send_notification(SessionNotification::new(
-                            session_id,
-                            SessionUpdate::AvailableCommandsUpdate(commands),
-                        ))
+                        let result: Result<_, agent_client_protocol::Error> = async {
+                            let response = service
+                                .fork_session(request.session_id.to_string(), request.cwd)
+                                .await?;
+                            let session_id = response.session_id.clone();
+                            let commands =
+                                service.available_commands(&session_id.to_string()).await?;
+                            Ok((response, session_id, commands))
+                        }
+                        .await;
+                        match result {
+                            Ok((response, session_id, commands)) => {
+                                responder.respond(
+                                    ForkSessionResponse::new(session_id.clone())
+                                        .modes(response.modes)
+                                        .config_options(response.config_options),
+                                )?;
+                                task_connection.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::AvailableCommandsUpdate(commands),
+                                ))
+                            }
+                            Err(error) => responder.respond_with_result(Err(error)),
+                        }
                     })
                 }
             },
@@ -148,19 +158,29 @@ pub async fn run(cwd: Option<PathBuf>) -> Result<()> {
                     let service = service.clone();
                     let task_connection = connection.clone();
                     connection.spawn(async move {
-                        let response = service
-                            .load_session(
-                                session_id.to_string(),
-                                request.cwd,
-                                task_connection.clone(),
-                            )
-                            .await?;
-                        let commands = service.available_commands(&session_id.to_string()).await?;
-                        responder.respond(response)?;
-                        task_connection.send_notification(SessionNotification::new(
-                            session_id,
-                            SessionUpdate::AvailableCommandsUpdate(commands),
-                        ))
+                        let result: Result<_, agent_client_protocol::Error> = async {
+                            let response = service
+                                .load_session(
+                                    session_id.to_string(),
+                                    request.cwd,
+                                    task_connection.clone(),
+                                )
+                                .await?;
+                            let commands =
+                                service.available_commands(&session_id.to_string()).await?;
+                            Ok((response, commands))
+                        }
+                        .await;
+                        match result {
+                            Ok((response, commands)) => {
+                                responder.respond(response)?;
+                                task_connection.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::AvailableCommandsUpdate(commands),
+                                ))
+                            }
+                            Err(error) => responder.respond_with_result(Err(error)),
+                        }
                     })
                 }
             },
@@ -174,15 +194,25 @@ pub async fn run(cwd: Option<PathBuf>) -> Result<()> {
                     let service = service.clone();
                     let task_connection = connection.clone();
                     connection.spawn(async move {
-                        let response = service
-                            .resume_session(session_id.to_string(), request.cwd)
-                            .await?;
-                        let commands = service.available_commands(&session_id.to_string()).await?;
-                        responder.respond(response)?;
-                        task_connection.send_notification(SessionNotification::new(
-                            session_id,
-                            SessionUpdate::AvailableCommandsUpdate(commands),
-                        ))
+                        let result: Result<_, agent_client_protocol::Error> = async {
+                            let response = service
+                                .resume_session(session_id.to_string(), request.cwd)
+                                .await?;
+                            let commands =
+                                service.available_commands(&session_id.to_string()).await?;
+                            Ok((response, commands))
+                        }
+                        .await;
+                        match result {
+                            Ok((response, commands)) => {
+                                responder.respond(response)?;
+                                task_connection.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::AvailableCommandsUpdate(commands),
+                                ))
+                            }
+                            Err(error) => responder.respond_with_result(Err(error)),
+                        }
                     })
                 }
             },
@@ -195,16 +225,26 @@ pub async fn run(cwd: Option<PathBuf>) -> Result<()> {
                     let service = service.clone();
                     let task_connection = connection.clone();
                     connection.spawn(async move {
-                        let response = service
-                            .new_session(request.cwd, request.mcp_servers)
-                            .await?;
-                        let session_id = response.session_id.clone();
-                        let commands = service.available_commands(&session_id.to_string()).await?;
-                        responder.respond(response)?;
-                        task_connection.send_notification(SessionNotification::new(
-                            session_id,
-                            SessionUpdate::AvailableCommandsUpdate(commands),
-                        ))
+                        let result: Result<_, agent_client_protocol::Error> = async {
+                            let response = service
+                                .new_session(request.cwd, request.mcp_servers)
+                                .await?;
+                            let session_id = response.session_id.clone();
+                            let commands =
+                                service.available_commands(&session_id.to_string()).await?;
+                            Ok((response, session_id, commands))
+                        }
+                        .await;
+                        match result {
+                            Ok((response, session_id, commands)) => {
+                                responder.respond(response)?;
+                                task_connection.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::AvailableCommandsUpdate(commands),
+                                ))
+                            }
+                            Err(error) => responder.respond_with_result(Err(error)),
+                        }
                     })
                 }
             },
