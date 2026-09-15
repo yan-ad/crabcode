@@ -620,7 +620,7 @@ impl OpenAI {
                     // Plugins are not Responses `tools` entries.
                 }
                 crate::aisdk::tool::ToolTransport::ClientFunction => {
-                    let schema = serde_json::to_value(&t.input_schema).unwrap_or_default();
+                    let schema = crate::tool::openai_compatible_input_schema(&t.input_schema);
                     let mut tool = serde_json::json!({
                         "type": "function",
                         "name": t.name,
@@ -3279,6 +3279,47 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn responses_body_removes_unsupported_tool_regex_lookaround() {
+        let provider = OpenAI::builder()
+            .base_url("https://api.openai.com")
+            .api_key("test-key")
+            .model_name("gpt-test")
+            .build()
+            .unwrap();
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "email": {
+                            "type": "string",
+                            "pattern": "^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let tools = vec![Tool::builder()
+            .name("contact_create")
+            .description("Create a contact")
+            .input_schema(schema)
+            .execute(ToolExecute::new(|_| async { Ok("ok") }))
+            .build()
+            .unwrap()];
+
+        let body = provider.build_responses_body(
+            vec![serde_json::json!({"role": "user", "content": "create contact"})],
+            &tools,
+        );
+
+        assert!(body
+            .pointer("/tools/0/parameters/properties/data/properties/email/pattern")
+            .is_none());
     }
 
     #[test]

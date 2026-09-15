@@ -141,7 +141,7 @@ impl Provider for OpenAICompatible {
         for t in tools {
             match &t.transport {
                 crate::aisdk::tool::ToolTransport::ClientFunction => {
-                    let schema = serde_json::to_value(&t.input_schema).unwrap_or_default();
+                    let schema = crate::tool::openai_compatible_input_schema(&t.input_schema);
                     tool_params.push(serde_json::json!({
                         "type": "function",
                         "function": {
