@@ -33,6 +33,7 @@ mod theme;
 mod toast;
 mod tools;
 mod ui;
+mod update;
 mod upgrade;
 mod utils;
 mod version;

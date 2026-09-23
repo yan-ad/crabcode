@@ -398,6 +398,10 @@ pub async fn load_models(parsed: ParsedCommand) -> CommandResult {
         };
 
         if let Ok(discovery) = discovery.as_ref() {
+            crate::model::discovery::merge_dialog_models(
+                &mut models,
+                discovery.discover_custom_models_for_dialog().await,
+            );
             discovery.apply_custom_models_to_dialog(&mut models);
         }
 
@@ -834,6 +838,7 @@ pub async fn refresh_models() -> CommandResult {
                 return CommandResult::Success(String::new());
             }
         };
+        discovery.clear_custom_model_discovery_cache();
 
         let (providers_result, runtime_result) = tokio::join!(
             discovery.refresh_cache(),

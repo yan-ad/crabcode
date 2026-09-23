@@ -1,6 +1,23 @@
 use anyhow::{bail, Context, Result};
 use semver::Version;
 use serde::Deserialize;
+
+pub(crate) const GITHUB_REPO: &str = "yan-ad/crabcode";
+
+/// Current binary version (`CARGO_PKG_VERSION`).
+pub(crate) fn current_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Upgrade without streaming installer output into the active TUI.
+pub(crate) fn upgrade_noninteractive(target: Option<&str>) -> Result<String> {
+    let release_tag = match target {
+        Some(target) if target != "latest" => target_release_tag(target)?,
+        _ => futures::executor::block_on(latest_release_tag())?,
+    };
+    run_installer(&release_tag)?;
+    Ok(release_tag)
+}
 use std::process::Command;
 
 const PREVIEW_RELEASES_URL: &str =
