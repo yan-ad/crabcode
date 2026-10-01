@@ -27,6 +27,29 @@ const INSTALLER_URL: &str = "https://raw.githubusercontent.com/yan-ad/crabcode";
 #[derive(Debug, Deserialize)]
 struct Release {
     tag_name: String,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+fn latest_preview_release_tag(releases: Vec<Release>) -> Result<String> {
+    releases
+        .into_iter()
+        .filter(|release| release.tag_name.starts_with("gondescode-"))
+        .max_by(|left, right| {
+            left.published_at
+                .as_deref()
+                .or(left.created_at.as_deref())
+                .cmp(
+                    &right
+                        .published_at
+                        .as_deref()
+                        .or(right.created_at.as_deref()),
+                )
+        })
+        .map(|release| release.tag_name)
+        .context("no crabcode preview release found")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -85,11 +108,7 @@ async fn latest_release_tag() -> Result<String> {
         .await
         .context("failed to read the latest crabcode release")?;
 
-    releases
-        .into_iter()
-        .find(|release| release.tag_name.starts_with("gondescode-"))
-        .map(|release| release.tag_name)
-        .context("no crabcode preview release found")
+    latest_preview_release_tag(releases)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -186,6 +205,27 @@ mod tests {
         assert_eq!(
             installer_command("gondescode-0123456789abcdef"),
              "curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/yan-ad/crabcode/gondescode-0123456789abcdef/install.sh | CRABCODE_PREVIEW_TAG=gondescode-0123456789abcdef sh"
+        );
+    }
+
+    #[test]
+    fn selects_latest_published_preview_instead_of_api_order() {
+        let releases = vec![
+            Release {
+                tag_name: "gondescode-older".to_string(),
+                published_at: Some("2026-10-01T04:24:03Z".to_string()),
+                created_at: Some("2026-10-01T04:13:03Z".to_string()),
+            },
+            Release {
+                tag_name: "gondescode-newer".to_string(),
+                published_at: Some("2026-10-01T04:47:59Z".to_string()),
+                created_at: Some("2026-10-01T04:39:53Z".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            latest_preview_release_tag(releases).unwrap(),
+            "gondescode-newer"
         );
     }
 

@@ -43,7 +43,12 @@ mkdir -p "$INSTALL_DIR"
 TAG="${CRABCODE_PREVIEW_TAG:-}"
 if [[ -z "$TAG" ]]; then
     TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" \
-        | sed -nE '/"tag_name": "gondescode-[^"]+"/{s/.*"tag_name": "([^"]+)".*/\1/p; q;}')"
+        | python3 -c '
+import json, sys
+previews = [release for release in json.load(sys.stdin) if release.get("tag_name", "").startswith("gondescode-")]
+previews.sort(key=lambda release: release.get("published_at") or release.get("created_at") or "", reverse=True)
+print(previews[0]["tag_name"] if previews else "")
+')"
 fi
 
 if [[ -z "$TAG" ]]; then
