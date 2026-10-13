@@ -189,6 +189,12 @@ impl AcpProcess {
             .unwrap(),
         )
         .expect("offline model fixture");
+        // Empty auth storage enables runtime-provider discovery in yan-flavor.
+        std::fs::write(
+            state.path().join("crabcode/auth.json"),
+            serde_json::json!({"offline": {"type": "api", "key": "dummy"}}).to_string(),
+        )
+        .expect("offline auth fixture");
         let mut child = Command::new(env!("CARGO_BIN_EXE_crabcode"))
             .args(["acp", "--cwd"])
             .arg(workspace)
