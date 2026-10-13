@@ -4,6 +4,15 @@ default:
 check-aisdk-boundary:
     bash scripts/check-aisdk-boundary.sh
 
+[doc('Check preview shell and npm installer behavior offline')]
+test-install-ui:
+    bun test --timeout 30000 scripts/install-ui.test.ts npm/install.test.js
+
+[doc('Check compiled preview upgrades and terminal rendering offline')]
+test-upgrade-ui:
+    cargo build --bin crabcode
+    bun test --timeout 30000 scripts/upgrade-ui.test.ts
+
 dev:
     cargo r
 

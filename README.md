@@ -33,17 +33,21 @@ npm install -g crabcode            # or npm
 bun install -g crabcode            # or bun
 cargo binstall crabcode            # or cargo-binstall (prebuilt binary, faster)
 cargo install crabcode             # or cargo (build from source)
-curl -sSL https://raw.githubusercontent.com/Blankeos/crabcode/main/install.sh | sh # or linux/macos (via curl)
+curl -fsSL https://raw.githubusercontent.com/yan-ad/crabcode/yan-flavor/install.sh | sh # fork preview (macOS ARM64/Linux x64)
 ```
+
+The fork shell installer downloads the newest `gondescode-*` preview from `yan-ad/crabcode` and installs to `~/.local/bin`. Set `CRABCODE_INSTALL_DIR` for a different destination, or pin a preview with `CRABCODE_PREVIEW_TAG=gondescode-<commit>`. New previews include SHA256 checksums; older previews without a checksum emit a warning. Installation and upgrades use compact version labels and amber progress in a terminal; redirected output stays plain.
 
 ### Upgrade
 
-Detects how you installed (brew / npm / bun / cargo / install.sh) and upgrades in place:
+This fork's upgrade command installs previews from `yan-ad/crabcode`, not upstream stable releases:
 
 ```sh
-crabcode upgrade          # latest
-crabcode upgrade 0.0.12   # specific version
+crabcode upgrade                        # newest published preview
+crabcode upgrade gondescode-<commit>    # specific preview tag
 ```
+
+The default destination is `~/.local/bin`; set `CRABCODE_INSTALL_DIR` to keep a custom preview installation in place.
 
 ## Quick Start
 

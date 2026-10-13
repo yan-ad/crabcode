@@ -67,12 +67,15 @@ jobs:
           cp target/release/crabcode "$staging/crabcode"
           cp README.md LICENSE* "$staging" 2>/dev/null || true
           tar -C "$staging" -czf "$archive" .
+          sha256sum "$archive" > "$archive.sha256"
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
           if-no-files-found: error
 
   release:

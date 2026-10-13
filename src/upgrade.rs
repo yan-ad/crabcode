@@ -1,28 +1,30 @@
 use anyhow::{bail, Context, Result};
 use semver::Version;
 use serde::Deserialize;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+mod progress;
 
 pub(crate) const GITHUB_REPO: &str = "yan-ad/crabcode";
 
-/// Current binary version (`CARGO_PKG_VERSION`).
+/// Effective build version, including timestamp versions in preview builds.
 pub(crate) fn current_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    crate::version::CURRENT.to_string()
 }
 
 /// Upgrade without streaming installer output into the active TUI.
 pub(crate) fn upgrade_noninteractive(target: Option<&str>) -> Result<String> {
     let release_tag = match target {
         Some(target) if target != "latest" => target_release_tag(target)?,
-        _ => futures::executor::block_on(latest_release_tag())?,
+        _ => latest_release_tag_captured()?,
     };
     run_installer(&release_tag)?;
     Ok(release_tag)
 }
-use std::process::Command;
 
 const PREVIEW_RELEASES_URL: &str =
     "https://api.github.com/repos/yan-ad/crabcode/releases?per_page=100";
-const INSTALLER_URL: &str = "https://raw.githubusercontent.com/yan-ad/crabcode";
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -36,7 +38,7 @@ struct Release {
 fn latest_preview_release_tag(releases: Vec<Release>) -> Result<String> {
     releases
         .into_iter()
-        .filter(|release| release.tag_name.starts_with("gondescode-"))
+        .filter(|release| target_release_tag(&release.tag_name).is_ok())
         .max_by(|left, right| {
             left.published_at
                 .as_deref()
@@ -71,17 +73,14 @@ fn check_version(current: &str, release_tag: &str) -> Result<VersionCheck> {
 }
 
 fn target_release_tag(target: &str) -> Result<String> {
-    if target.starts_with("gondescode-") {
+    if target.strip_prefix("gondescode-").is_some_and(|commit| {
+        ((7..=40).contains(&commit.len()) || commit.len() == 64)
+            && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
         return Ok(target.to_owned());
     }
 
     bail!("invalid target release {target:?}; expected a gondescode-<commit> preview tag or latest")
-}
-
-fn installer_command(release_tag: &str) -> String {
-    format!(
-        "curl --proto '=https' --tlsv1.2 -LsSf {INSTALLER_URL}/{release_tag}/install.sh | CRABCODE_PREVIEW_TAG={release_tag} sh"
-    )
 }
 
 fn run_upgrade<F>(check: VersionCheck, install: F) -> Result<VersionCheck>
@@ -96,7 +95,9 @@ where
 }
 
 async fn latest_release_tag() -> Result<String> {
-    let releases = reqwest::Client::new()
+    let releases = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
         .get(PREVIEW_RELEASES_URL)
         .header(reqwest::header::USER_AGENT, "crabcode-upgrade")
         .send()
@@ -111,15 +112,58 @@ async fn latest_release_tag() -> Result<String> {
     latest_preview_release_tag(releases)
 }
 
+fn latest_release_tag_captured() -> Result<String> {
+    let output = Command::new("curl")
+        .args([
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "-fsSL",
+            "--max-time",
+            "10",
+            "-H",
+            "User-Agent: crabcode-upgrade",
+            PREVIEW_RELEASES_URL,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to check the latest preview release")?;
+    if !output.status.success() {
+        bail!(
+            "preview release lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    latest_preview_release_tag(serde_json::from_slice(&output.stdout)?)
+}
+
 #[cfg(not(target_os = "windows"))]
 fn run_installer(release_tag: &str) -> Result<()> {
-    let status = Command::new("sh")
-        .args(["-c", &installer_command(release_tag)])
-        .status()
+    use std::io::Write;
+    let mut script = tempfile::NamedTempFile::with_suffix(".sh")?;
+    script.write_all(include_bytes!("../install.sh"))?;
+    script.flush()?;
+    let output = Command::new("sh")
+        .arg(script.path())
+        .arg(release_tag)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .context("failed to start the crabcode installer")?;
 
-    if !status.success() {
-        bail!("crabcode installer exited with {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        bail!("crabcode installer exited with {}\n{tail}", output.status);
     }
 
     Ok(())
@@ -131,13 +175,15 @@ fn run_installer(_release_tag: &str) -> Result<()> {
 }
 
 pub async fn upgrade(target: Option<&str>) -> Result<()> {
+    eprintln!("Installed version: {}", current_version());
     let release_tag = match target {
         Some(target) if target != "latest" => target_release_tag(target)?,
         _ => latest_release_tag().await?,
     };
     if release_tag.starts_with("gondescode-") {
-        run_installer(&release_tag)?;
-        println!("Upgraded crabcode to preview {release_tag}.");
+        eprintln!("\nUpgrading crabcode version: {release_tag}");
+        progress::run(|| run_installer(&release_tag))?;
+        eprintln!("Upgraded crabcode to preview {release_tag}. Restart crabcode to apply.");
         return Ok(());
     }
 
@@ -146,10 +192,10 @@ pub async fn upgrade(target: Option<&str>) -> Result<()> {
 
     match check {
         VersionCheck::UpToDate { current, .. } => {
-            println!("crabcode v{current} is already up to date.")
+            eprintln!("crabcode v{current} is already up to date.")
         }
         VersionCheck::UpdateAvailable { current, latest } => {
-            println!("Upgraded crabcode from v{current} to v{latest}.")
+            eprintln!("Upgraded crabcode from v{current} to v{latest}.")
         }
     }
 
@@ -201,23 +247,28 @@ mod tests {
     }
 
     #[test]
-    fn builds_an_installer_command_for_the_requested_release() {
-        assert_eq!(
-            installer_command("gondescode-0123456789abcdef"),
-             "curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/yan-ad/crabcode/gondescode-0123456789abcdef/install.sh | CRABCODE_PREVIEW_TAG=gondescode-0123456789abcdef sh"
-        );
+    fn rejects_tags_that_could_escape_the_release_url() {
+        for target in [
+            "gondescode-",
+            "gondescode-abc",
+            "gondescode-abcd123;echo",
+            "gondescode-../../main",
+            "gondescode-abcd123\n",
+        ] {
+            assert!(target_release_tag(target).is_err());
+        }
     }
 
     #[test]
     fn selects_latest_published_preview_instead_of_api_order() {
         let releases = vec![
             Release {
-                tag_name: "gondescode-older".to_string(),
+                tag_name: "gondescode-0000000".to_string(),
                 published_at: Some("2026-10-01T04:24:03Z".to_string()),
                 created_at: Some("2026-10-01T04:13:03Z".to_string()),
             },
             Release {
-                tag_name: "gondescode-newer".to_string(),
+                tag_name: "gondescode-1111111".to_string(),
                 published_at: Some("2026-10-01T04:47:59Z".to_string()),
                 created_at: Some("2026-10-01T04:39:53Z".to_string()),
             },
@@ -225,8 +276,43 @@ mod tests {
 
         assert_eq!(
             latest_preview_release_tag(releases).unwrap(),
-            "gondescode-newer"
+            "gondescode-1111111"
         );
+    }
+
+    #[test]
+    fn latest_selection_ignores_invalid_tags_and_uses_creation_date() {
+        let releases = vec![
+            Release {
+                tag_name: "gondescode-abcd123;echo".into(),
+                published_at: Some("2026-10-14T00:00:00Z".into()),
+                created_at: None,
+            },
+            Release {
+                tag_name: "v0.0.14".into(),
+                published_at: Some("2026-10-14T00:00:00Z".into()),
+                created_at: None,
+            },
+            Release {
+                tag_name: "gondescode-abcdef0".into(),
+                published_at: None,
+                created_at: Some("2026-10-13T00:00:00Z".into()),
+            },
+        ];
+        assert_eq!(
+            latest_preview_release_tag(releases).unwrap(),
+            "gondescode-abcdef0"
+        );
+    }
+
+    #[test]
+    fn latest_selection_fails_without_a_valid_preview() {
+        assert!(latest_preview_release_tag(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn current_version_uses_effective_preview_build_version() {
+        assert_eq!(current_version(), crate::version::CURRENT);
     }
 
     #[test]
