@@ -176,6 +176,19 @@ impl AcpProcess {
         let home = tempfile::tempdir().expect("home");
         let config = tempfile::tempdir().expect("config");
         let state = tempfile::tempdir().expect("state");
+        // Valid session setup must not depend on live models.dev availability.
+        let cache = state.path().join("crabcode/cache");
+        std::fs::create_dir_all(&cache).expect("cache directory");
+        std::fs::write(
+            cache.join("models_dev_cache.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "data": {}, "schema_version": 5,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            }))
+            .unwrap(),
+        )
+        .expect("offline model fixture");
         let mut child = Command::new(env!("CARGO_BIN_EXE_crabcode"))
             .args(["acp", "--cwd"])
             .arg(workspace)
@@ -299,6 +312,20 @@ fn initialize_over_stdio_and_shutdown_on_eof() {
 #[test]
 fn session_load_error_keeps_stdio_transport_open() {
     let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        workspace.path().join("crabcode.json"),
+        serde_json::json!({
+            "model": "offline/chat",
+            "enabled_providers": ["offline"],
+            "provider": {"offline": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"apiKey": "dummy"},
+                "models": {"chat": {"limit": {"context": 100000, "output": 1000}}}
+            }}
+        })
+        .to_string(),
+    )
+    .expect("offline workspace config");
     let mut process = AcpProcess::spawn(workspace.path());
     initialize(&mut process);
 
