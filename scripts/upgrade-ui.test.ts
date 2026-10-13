@@ -206,7 +206,7 @@ function successful(
   expect(result.text).not.toContain("already up to date");
   expect(readFileSync(f.installed, "utf8")).toBe(newBinary);
   expect(existsSync(join(f.prefix, "bin/crabcode"))).toBe(false);
-  const asset = `https://github.com/yan-ad/crabcode/releases/download/${version}/crabcode-${version.slice(10, 17)}-${f.platform}.tar.gz`;
+  const asset = `https://github.com/yan-ad/crabcode/releases/download/${version}/crabcode-${version.slice("gondescode-".length, "gondescode-".length + 7)}-${f.platform}.tar.gz`;
   expect(f.log().trim().split("\n")).toEqual([asset, `${asset}.sha256`]);
 }
 
