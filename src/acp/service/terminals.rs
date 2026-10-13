@@ -1,4 +1,4 @@
-use super::notifications::absolute_tool_path;
+use super::tool_locations::absolute_tool_path;
 use agent_client_protocol::schema::v1::CreateTerminalRequest;
 use agent_client_protocol::schema::v1::KillTerminalRequest;
 use agent_client_protocol::schema::v1::ReleaseTerminalRequest;
@@ -150,6 +150,7 @@ pub(super) async fn bridge_terminal_session(
 #[cfg(test)]
 mod tests {
     use super::super::AcpService;
+
     use std::path::Path;
 
     #[test]
