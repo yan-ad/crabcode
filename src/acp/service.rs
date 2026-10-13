@@ -3714,7 +3714,7 @@ mod tests {
                     .replace_session_messages(&session_id, compacted)
                     .unwrap();
                 let service = AcpService {
-                    sessions: Arc::new(AsyncMutex::new(AcpSessions::default())),
+                    sessions: Arc::new(AsyncMutex::new(HashMap::new())),
                     session_manager: Arc::new(Mutex::new(manager)),
                     client_capabilities: Arc::new(Mutex::new(Default::default())),
                 };
