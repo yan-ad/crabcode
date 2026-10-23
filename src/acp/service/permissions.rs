@@ -36,6 +36,7 @@ fn permission_tool_call_id(tool_call_id: Option<&str>) -> String {
 pub(super) fn configured_tool_permissions(
     cwd: &Path,
     config: &LoadedConfig,
+    dangerously_skip_permissions: bool,
 ) -> crate::tools::ToolPermissions {
     let mut policies = crate::tools::AgentToolPolicies::default();
     for (mode, tools) in config.merged_config.agent_registry.tool_policy_map() {
@@ -43,8 +44,10 @@ pub(super) fn configured_tool_permissions(
     }
     crate::tools::ToolPermissions::new(cwd)
         .with_agent_policies(policies)
+        .with_global_tool_config(config.merged_config.tools.clone())
         .with_permission_rules(config.merged_config.permission_rules.clone())
         .with_agent_permission_rules(config.merged_config.agent_registry.permission_rules_map())
+        .dangerously_skip_permissions(dangerously_skip_permissions)
 }
 
 pub(super) fn tool_permissions(session: &AcpSession) -> crate::tools::ToolPermissions {
@@ -115,6 +118,7 @@ fn permission_title(prompt: &crate::tools::PermissionPrompt) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::empty_config;
     use super::super::test_support::test_session;
     use super::*;
     use agent_client_protocol::schema::v1::PermissionOptionKind;
@@ -138,6 +142,81 @@ mod tests {
             .expect("always option");
         assert_eq!(always.name, "Always allow for this session");
         assert_eq!(always.kind, PermissionOptionKind::AllowAlways);
+    }
+
+    #[tokio::test]
+    async fn acp_auto_bypasses_prompts_but_preserves_restrictions() {
+        use crate::tools::{PermissionPolicyAction, PermissionRule};
+        let mut config = empty_config();
+        config.merged_config.tools.insert("bash".into(), false);
+        config.merged_config.permission_rules.push(PermissionRule {
+            permission: "*".into(),
+            pattern: "*".into(),
+            action: PermissionPolicyAction::Ask,
+        });
+        let permissions = configured_tool_permissions(Path::new("/tmp/workspace"), &config, true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..4 {
+            for (tool, params) in [
+                (
+                    "read",
+                    serde_json::json!({"file_path": "/tmp/external/.env"}),
+                ),
+                (
+                    "write",
+                    serde_json::json!({"file_path": "/tmp/external/output.txt", "content": "test"}),
+                ),
+            ] {
+                assert!(permissions
+                    .preflight("build", tool, &params, Some(&tx))
+                    .await
+                    .is_ok());
+            }
+        }
+        assert!(permissions
+            .preflight(
+                "build",
+                "bash",
+                &serde_json::json!({"command": "echo test"}),
+                Some(&tx)
+            )
+            .await
+            .is_err());
+        assert!(permissions
+            .preflight(
+                "plan",
+                "write",
+                &serde_json::json!({"file_path": "/tmp/workspace/output.txt", "content": "test"}),
+                Some(&tx)
+            )
+            .await
+            .is_err());
+        for permission in ["read", "external_directory"] {
+            let mut denied_config = config.clone();
+            denied_config
+                .merged_config
+                .permission_rules
+                .push(PermissionRule {
+                    permission: permission.into(),
+                    pattern: "*".into(),
+                    action: PermissionPolicyAction::Deny,
+                });
+            let denied =
+                configured_tool_permissions(Path::new("/tmp/workspace"), &denied_config, true);
+            assert!(denied
+                .preflight(
+                    "build",
+                    "read",
+                    &serde_json::json!({"file_path": "/tmp/external/file.txt"}),
+                    Some(&tx)
+                )
+                .await
+                .is_err());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "auto mode emitted a permission prompt"
+        );
     }
 
     #[tokio::test]

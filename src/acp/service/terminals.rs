@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn terminal_support_tracks_client_capability() {
-        let service = AcpService::new(Path::new("/tmp")).unwrap();
+        let service = AcpService::new(Path::new("/tmp"), false).unwrap();
         assert!(!service.supports_terminals());
 
         service.set_client_capabilities(

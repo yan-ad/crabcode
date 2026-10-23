@@ -109,7 +109,8 @@ impl AcpService {
         };
 
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
-        let tool_permissions = configured_tool_permissions(&cwd, &config);
+        let tool_permissions =
+            configured_tool_permissions(&cwd, &config, self.dangerously_skip_permissions);
         self.sessions.lock().await.attachments.insert(
             session_id.clone(),
             AcpSession {
@@ -234,7 +235,11 @@ impl AcpService {
         self.sessions.lock().await.attachments.insert(
             fork_id.clone(),
             AcpSession {
-                tool_permissions: configured_tool_permissions(&source.cwd, &source.config),
+                tool_permissions: configured_tool_permissions(
+                    &source.cwd,
+                    &source.config,
+                    self.dangerously_skip_permissions,
+                ),
                 ..source.clone()
             },
         );
@@ -337,7 +342,8 @@ impl AcpService {
             reasoning.unwrap_or(crate::model::reasoning::ReasoningEffort::None);
         let context_window = model_context_window(&config, &models, &provider, &model);
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
-        let tool_permissions = configured_tool_permissions(&cwd, &config);
+        let tool_permissions =
+            configured_tool_permissions(&cwd, &config, self.dangerously_skip_permissions);
         let session = AcpSession {
             cwd,
             config,

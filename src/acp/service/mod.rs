@@ -42,6 +42,7 @@ pub struct AcpService {
     sessions: Arc<AsyncMutex<AcpSessions>>,
     session_manager: Arc<Mutex<SessionManager>>,
     client_capabilities: Arc<Mutex<agent_client_protocol::schema::v1::ClientCapabilities>>,
+    dangerously_skip_permissions: bool,
 }
 
 #[derive(Clone)]
@@ -69,7 +70,10 @@ fn internal_error_with(error: &str) -> Error {
 }
 
 impl AcpService {
-    pub fn new(initial_workspace: &Path) -> Result<Self, Error> {
+    pub fn new(
+        initial_workspace: &Path,
+        dangerously_skip_permissions: bool,
+    ) -> Result<Self, Error> {
         let session_manager = SessionManager::new()
             .with_history_for_workspace(initial_workspace)
             .map_err(|_| internal_error())?;
@@ -77,6 +81,7 @@ impl AcpService {
             sessions: Arc::new(AsyncMutex::new(AcpSessions::default())),
             session_manager: Arc::new(Mutex::new(session_manager)),
             client_capabilities: Arc::new(Mutex::new(Default::default())),
+            dangerously_skip_permissions,
         })
     }
 

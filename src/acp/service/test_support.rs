@@ -87,7 +87,7 @@ pub(super) fn session_with_config(config: LoadedConfig) -> AcpSession {
     let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
     AcpSession {
         cwd: config.cwd.clone(),
-        tool_permissions: configured_tool_permissions(&config.cwd, &config),
+        tool_permissions: configured_tool_permissions(&config.cwd, &config, false),
         config,
         skills,
         models: Vec::new(),

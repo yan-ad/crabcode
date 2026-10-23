@@ -199,6 +199,7 @@ async fn acp_compaction_notifies_client_of_reduced_context_and_summary_cost() {
                 sessions: Arc::new(AsyncMutex::new(super::super::AcpSessions::default())),
                 session_manager: Arc::new(Mutex::new(manager)),
                 client_capabilities: Arc::new(Mutex::new(Default::default())),
+                dangerously_skip_permissions: false,
             };
             let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
             let client = Client.builder().on_receive_notification(

@@ -66,6 +66,7 @@ async fn cancelled_stream_finalizes(pending_permission: bool, close_reopen: bool
             sessions: Arc::new(AsyncMutex::new(AcpSessions::default())),
             session_manager: Arc::new(Mutex::new(manager)),
             client_capabilities: Arc::new(Mutex::new(Default::default())),
+            dangerously_skip_permissions: false,
         };
         let session = session_with_config(empty_config());
         service.sessions.lock().await.attachments.insert(session_id.clone(), session.clone());

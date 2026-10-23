@@ -9075,12 +9075,12 @@ mod tests {
     #[test]
     fn test_edit_tool_renders_codex_style_diff_summary() {
         let chat = Chat::new();
-        let file_path = "/Users/carlo/Desktop/Projects/crabcode/README.md";
+        let path = std::env::current_dir().unwrap().join("README.md");
         let content = serde_json::json!({
             "name": "edit",
             "status": "ok",
             "args": {
-                "file_path": file_path,
+                "file_path": path,
                 "old_string": "alpha\nbeta\nomega",
                 "new_string": "alpha\nbravo\nomega",
             },
@@ -9093,7 +9093,10 @@ mod tests {
 
         let lines = chat.format_tool_row(&msg, 80, &colors, false);
         let rendered = lines.iter().map(trimmed_line_text).collect::<Vec<_>>();
-        let expected_title = format!("⬢ Edited {} (+1 -1)", display_path(file_path, false));
+        let expected_title = format!(
+            "⬢ Edited {} (+1 -1)",
+            display_path(&path.to_string_lossy(), false)
+        );
 
         assert_eq!(
             rendered,
