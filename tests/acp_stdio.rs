@@ -131,7 +131,11 @@ impl MockCompactionProvider {
                 format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
             )
         };
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
         stream.flush()
     }
 
@@ -280,13 +284,20 @@ impl AcpProcess {
 }
 
 fn initialize(process: &mut AcpProcess) -> serde_json::Value {
+    initialize_with_capabilities(process, serde_json::json!({}))
+}
+
+fn initialize_with_capabilities(
+    process: &mut AcpProcess,
+    capabilities: serde_json::Value,
+) -> serde_json::Value {
     process.send(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
         "params": {
             "protocolVersion": 1,
-            "clientCapabilities": {}
+            "clientCapabilities": capabilities
         }
     }));
     process.recv_response(1).0
@@ -313,6 +324,135 @@ fn initialize_over_stdio_and_shutdown_on_eof() {
     );
 
     process.close_and_wait();
+}
+
+#[test]
+fn initialize_advertises_modern_terminal_auth_over_stdio() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    for capabilities in [
+        serde_json::json!({"auth": {"terminal": true}}),
+        serde_json::json!({
+            "auth": {"terminal": true},
+            "_meta": {"terminal-auth": true}
+        }),
+    ] {
+        let mut process = AcpProcess::spawn(workspace.path());
+        let response = initialize_with_capabilities(&mut process, capabilities);
+        let methods = response["result"]["authMethods"]
+            .as_array()
+            .expect("auth methods");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["id"], "crabcode-login");
+        assert_eq!(methods[0]["type"], "terminal");
+        assert_eq!(methods[0]["args"], serde_json::json!(["--login"]));
+        assert!(methods[0].get("command").is_none());
+        assert!(methods[0].get("env").is_none());
+        assert!(methods[0].get("_meta").is_none());
+        process.close_and_wait();
+    }
+}
+
+#[test]
+fn initialize_advertises_registry_terminal_auth_over_stdio() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut process = AcpProcess::spawn(workspace.path());
+    let response = initialize_with_capabilities(
+        &mut process,
+        serde_json::json!({
+            "terminal": true,
+            "fs": {"readTextFile": true, "writeTextFile": true},
+            "_meta": {"terminal_output": true, "terminal-auth": true}
+        }),
+    );
+    let methods = response["result"]["authMethods"]
+        .as_array()
+        .expect("auth methods");
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0]["id"], "crabcode-login");
+    assert_eq!(
+        methods[0]["_meta"]["terminal-auth"]["args"],
+        serde_json::json!(["acp", "--login"])
+    );
+    assert!(methods[0].get("type").is_none());
+    assert!(methods[0].get("args").is_none());
+    assert!(methods[0].get("command").is_none());
+    assert!(methods[0].get("env").is_none());
+    process.close_and_wait();
+}
+
+#[test]
+fn initialize_does_not_advertise_unsupported_auth_over_stdio() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    for capabilities in [
+        serde_json::json!({}),
+        serde_json::json!({"terminal": true}),
+        serde_json::json!({"auth": {"terminal": false}}),
+        serde_json::json!({"_meta": {"terminal-auth": false}}),
+        serde_json::json!({"terminal": true, "_meta": {"terminal_output": true}}),
+    ] {
+        let mut process = AcpProcess::spawn(workspace.path());
+        let response = initialize_with_capabilities(&mut process, capabilities.clone());
+        assert_eq!(
+            response["result"]["authMethods"],
+            serde_json::json!([]),
+            "unsupported client capabilities: {capabilities}"
+        );
+        process.close_and_wait();
+    }
+}
+
+#[test]
+fn login_with_piped_stdin_fails_promptly_without_protocol_output_or_secrets() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("home");
+    let config = tempfile::tempdir().expect("config");
+    let state = tempfile::tempdir().expect("state");
+    let secret = "acp-stdio-secret-must-never-be-printed";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crabcode"))
+        .args(["acp", "--login", "--cwd"])
+        .arg(workspace.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("OPENAI_API_KEY", secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn crabcode acp --login");
+    // Keep the pipe open: login must reject non-TTY input, not wait for EOF or
+    // accidentally start the stdio JSON-RPC server.
+    let mut stdin = child.stdin.take().expect("stdin");
+    if let Err(error) = writeln!(stdin, "openai\n3\n{secret}") {
+        // An immediate rejection can close the read end before this write.
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().expect("poll login process").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ACP login did not promptly reject piped stdin");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("collect login output");
+    assert!(!output.status.success(), "non-TTY login must fail");
+    assert!(output.stdout.is_empty(), "login must not write to stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires an interactive terminal"));
+    assert!(
+        !stderr.contains(secret),
+        "login must not expose credentials"
+    );
+    assert!(
+        !state.path().join("crabcode/auth.json").exists(),
+        "rejected login must not persist credentials"
+    );
 }
 
 #[test]

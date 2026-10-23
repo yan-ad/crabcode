@@ -1,3 +1,4 @@
+use super::cancellable;
 use super::compaction_summary::compacted_messages;
 use super::compaction_summary::compaction_reasoning;
 use super::context::acp_context_tokens;
@@ -22,18 +23,8 @@ impl AcpService {
         session_id: &str,
         session: AcpSession,
         connection: ConnectionTo<Client>,
+        cancellation: CancellationToken,
     ) -> Result<PromptResponse, Error> {
-        let cancellation = CancellationToken::new();
-        {
-            let mut sessions = self.sessions.lock().await;
-            let current = sessions
-                .get_mut(session_id)
-                .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
-            if current.cancellation.is_some() {
-                return Err(Error::invalid_params().data("session already has an active prompt"));
-            }
-            current.cancellation = Some(cancellation.clone());
-        }
         let status_result = self
             .session_manager
             .lock()
@@ -44,22 +35,24 @@ impl AcpService {
                 None,
             );
         if status_result.is_err() {
-            if let Some(current) = self.sessions.lock().await.get_mut(session_id) {
-                current.cancellation = None;
-            }
             return Err(internal_error());
         }
 
         let result = self
             .run_compaction(session_id, &session, cancellation.clone(), 0)
             .await;
-        if let Some(current) = self.sessions.lock().await.get_mut(session_id) {
-            current.cancellation = None;
-        }
         self.session_manager
             .lock()
             .map_err(|_| internal_error())?
-            .set_session_status(session_id, crate::session::types::SessionStatus::Idle, None)
+            .set_session_status(
+                session_id,
+                if cancellation.is_cancelled() {
+                    crate::session::types::SessionStatus::Interrupted
+                } else {
+                    crate::session::types::SessionStatus::Idle
+                },
+                None,
+            )
             .map_err(|_| internal_error())?;
 
         match result {
@@ -98,14 +91,18 @@ impl AcpService {
         let before_messages =
             crate::session::compaction::filter_messages_for_context(&messages).len();
         let prompt = crate::session::compaction::build_prompt(&selection.messages_to_summarize);
-        let summary = crate::llm::client::summarize_for_compaction(
-            session.provider.clone(),
-            session.model.clone(),
-            compaction_reasoning(session),
-            prompt,
-            cancellation.clone(),
+        let summary = cancellable(
+            &cancellation,
+            crate::llm::client::summarize_for_compaction(
+                session.provider.clone(),
+                session.model.clone(),
+                compaction_reasoning(session),
+                prompt,
+                cancellation.clone(),
+            ),
         )
         .await
+        .ok_or_else(|| internal_error_with("Compaction cancelled by user"))?
         .map_err(|error| internal_error_with(&error.to_string()))?;
         if cancellation.is_cancelled() {
             return Err(internal_error_with("Compaction cancelled by user"));
@@ -172,14 +169,22 @@ impl AcpService {
             .run_compaction(
                 session_id,
                 session,
-                cancellation,
+                cancellation.clone(),
                 crate::session::compaction::MIN_COMPACTABLE_TOKENS,
             )
             .await;
         self.session_manager
             .lock()
             .map_err(|_| internal_error())?
-            .set_session_status(session_id, crate::session::types::SessionStatus::Idle, None)
+            .set_session_status(
+                session_id,
+                if cancellation.is_cancelled() {
+                    crate::session::types::SessionStatus::Interrupted
+                } else {
+                    crate::session::types::SessionStatus::Idle
+                },
+                None,
+            )
             .map_err(|_| internal_error())?;
         match result {
             Ok(stats) => {

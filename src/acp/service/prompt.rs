@@ -1,34 +1,20 @@
 use super::attachment_storage::ManagedAttachmentGuard;
 use super::attachments::model_supports_audio;
 use super::attachments::prompt_content;
+use super::cancellable;
 use super::command_expansion::expand_slash_command;
 use super::command_expansion::SlashExpansion;
 use super::commands::command_text;
 use super::commands::compact_command;
 use super::context::acp_context_tokens;
 use super::internal_error;
-use super::internal_error_with;
 use super::models::find_selectable_model;
 use super::models::model_context_window;
 use super::models::resolved_reasoning;
-use super::notifications::send_text;
-use super::notifications::send_tool_call;
-use super::notifications::send_tool_result;
-use super::permissions::request_permission;
 use super::permissions::tool_permissions;
-use super::questions::request_questions;
-use super::questions::skipped_question_answers;
 use super::replay::send_replay_text;
-use super::stream::acp_stop_reason;
-use super::terminals::bridge_terminal_session;
-use super::transcript::record_tool_call;
-use super::transcript::record_tool_result;
 use super::usage::acp_session_cost;
-use super::usage::cumulative_cost;
-use super::usage::estimate_session_usage_cost;
-use super::usage::send_live_usage;
 use super::usage::send_usage;
-use super::usage::AcpLiveUsage;
 use super::AcpService;
 use agent_client_protocol::schema::v1::ContentBlock;
 use agent_client_protocol::schema::v1::PromptResponse;
@@ -54,10 +40,57 @@ impl AcpService {
         prompt: Vec<ContentBlock>,
         connection: ConnectionTo<Client>,
     ) -> Result<PromptResponse, Error> {
+        let cancellation = self.sessions.lock().await.begin_prompt(&session_id)?;
+        // Only individual blocking operations are cancellable. Dropping prompt_inner
+        // would skip transcript persistence and leave the session marked active.
+        let mut result = self
+            .prompt_inner(session_id.clone(), prompt, connection, cancellation.clone())
+            .await;
+        if cancellation.is_cancelled() {
+            result = Ok(PromptResponse::new(StopReason::Cancelled));
+        }
+        // Cover setup errors and local commands as well as stream/compaction exits.
+        if let Ok(mut manager) = self.session_manager.lock() {
+            let status = if cancellation.is_cancelled()
+                || result
+                    .as_ref()
+                    .is_ok_and(|response| response.stop_reason == StopReason::Cancelled)
+            {
+                crate::session::types::SessionStatus::Interrupted
+            } else if result.is_err() {
+                crate::session::types::SessionStatus::Failed
+            } else {
+                crate::session::types::SessionStatus::Idle
+            };
+            if manager.get_session_ref(&session_id).is_some() {
+                if manager
+                    .set_session_status(&session_id, status, None)
+                    .is_err()
+                {
+                    result = Err(internal_error());
+                }
+            }
+        } else {
+            result = Err(internal_error());
+        }
+        // Also stop any detached producer after an error or early return.
+        cancellation.cancel();
+        self.sessions.lock().await.finish_prompt(&session_id);
+        result
+    }
+
+    async fn prompt_inner(
+        &self,
+        session_id: String,
+        prompt: Vec<ContentBlock>,
+        connection: ConnectionTo<Client>,
+        cancellation: CancellationToken,
+    ) -> Result<PromptResponse, Error> {
         let mut session = self
             .sessions
             .lock()
             .await
+            .attachments
             .get(&session_id)
             .cloned()
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
@@ -69,10 +102,17 @@ impl AcpService {
             {
                 return Err(Error::invalid_params().data("/compact does not accept attachments"));
             }
-            return self.compact_session(&session_id, session, connection).await;
+            return self
+                .compact_session(&session_id, session, connection, cancellation)
+                .await;
         }
         let expansion = if compact_text.trim_start().starts_with('/') {
-            Some(expand_slash_command(&session, &compact_text).await?)
+            let Some(expansion) =
+                cancellable(&cancellation, expand_slash_command(&session, &compact_text)).await
+            else {
+                return Ok(PromptResponse::new(StopReason::Cancelled));
+            };
+            Some(expansion?)
         } else {
             None
         };
@@ -131,7 +171,7 @@ impl AcpService {
                     return Err(Error::invalid_params().data("/btw does not accept attachments"));
                 }
                 return self
-                    .btw_session(&session_id, session, question, connection)
+                    .btw_session(&session_id, session, question, connection, cancellation)
                     .await;
             }
             None => None,
@@ -157,18 +197,6 @@ impl AcpService {
         if prompt.trim().is_empty() {
             return Err(Error::invalid_params().data("prompt must include text content"));
         }
-        let cancellation = CancellationToken::new();
-        {
-            let mut sessions = self.sessions.lock().await;
-            let Some(current) = sessions.get_mut(&session_id) else {
-                return Err(Error::invalid_params().data("unknown session"));
-            };
-            if current.cancellation.is_some() {
-                return Err(Error::invalid_params().data("session already has an active prompt"));
-            }
-            current.cancellation = Some(cancellation.clone());
-        }
-
         let mut messages = {
             let mut manager = self.session_manager.lock().map_err(|_| internal_error())?;
             let stored = manager
@@ -182,33 +210,45 @@ impl AcpService {
         user_message.provider = Some(session.provider.clone());
         user_message.model = Some(session.model.clone());
         user_message.agent_mode = Some(session.agent.clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let process_registry = std::sync::Arc::new(crate::tools::ProcessRegistry::new());
-        let prompt_registry = crate::tools::initialize_tool_registry_with_dynamic_config(
-            Some(sender.clone()),
-            tool_permissions(&session),
-            session.config.merged_config.agent_registry.clone(),
-            cancellation.clone(),
-            Some(&session.provider),
-            &session.config.merged_config.websearch,
-            &session.config.merged_config.mcp,
-            &session.cwd,
-            process_registry.clone(),
+        let prompt_registry = cancellable(
+            &cancellation,
+            crate::tools::initialize_tool_registry_with_dynamic_config(
+                Some(sender.clone()),
+                tool_permissions(&session),
+                session.config.merged_config.agent_registry.clone(),
+                cancellation.clone(),
+                Some(&session.provider),
+                &session.config.merged_config.websearch,
+                &session.config.merged_config.mcp,
+                &session.cwd,
+                process_registry.clone(),
+            ),
         )
         .await;
+        let Some(prompt_registry) = prompt_registry else {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        };
         let is_git_repo =
             crate::utils::git::is_git_repo(&session.cwd.to_string_lossy()).unwrap_or(false);
-        let system_prompt = crate::prompt::SystemPromptComposer::new(
-            &session.model,
-            session.cwd.to_string_lossy(),
-            is_git_repo,
-            std::env::consts::OS,
+        let system_prompt = cancellable(
+            &cancellation,
+            crate::prompt::SystemPromptComposer::new(
+                &session.model,
+                session.cwd.to_string_lossy(),
+                is_git_repo,
+                std::env::consts::OS,
+            )
+            .with_tool_registry(prompt_registry.clone())
+            .with_agent_registry(session.config.merged_config.agent_registry.clone())
+            .with_active_agent(session.agent.clone())
+            .compose(),
         )
-        .with_tool_registry(prompt_registry.clone())
-        .with_agent_registry(session.config.merged_config.agent_registry.clone())
-        .with_active_agent(session.agent.clone())
-        .compose()
         .await;
+        let Some(system_prompt) = system_prompt else {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        };
         let system_message = crate::session::types::Message::system(system_prompt);
         let prompt_tokens = crate::session::compaction::message_context_tokens(&system_message);
         let auto_compacted = self
@@ -222,9 +262,6 @@ impl AcpService {
             )
             .await?;
         if cancellation.is_cancelled() {
-            if let Some(current) = self.sessions.lock().await.get_mut(&session_id) {
-                current.cancellation = None;
-            }
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
         if auto_compacted {
@@ -301,221 +338,30 @@ impl AcpService {
             let _ = stream_sender.send(crate::llm::ChunkMessage::End);
         });
 
-        let mut assistant = crate::session::types::Message::incomplete("");
-        let message_id = assistant.id.clone();
-        assistant.provider = Some(session.provider.clone());
-        assistant.model = Some(session.model.clone());
-        assistant.agent_mode = Some(session.agent.clone());
-        let mut failed = None;
-        let mut cancelled = false;
-        let mut turn_stop_reason = None;
-        let mut live_usage = AcpLiveUsage::default();
-
-        while let Some(chunk) = receiver.recv().await {
-            match chunk {
-                crate::llm::ChunkMessage::Text(text) => {
-                    assistant.append(&text);
-                    send_text(&connection, &session_id, &message_id, text, false)?;
-                    send_live_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        base_context_tokens,
-                        base_cost,
-                        &assistant,
-                        &live_usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::Reasoning(text) => {
-                    assistant.append_reasoning(&text);
-                    send_text(&connection, &session_id, &message_id, text, true)?;
-                    send_live_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        base_context_tokens,
-                        base_cost,
-                        &assistant,
-                        &live_usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::ToolCalls(tool_calls) => {
-                    for tool_call in &tool_calls {
-                        record_tool_call(&mut assistant, tool_call);
-                    }
-                    for tool_call in tool_calls {
-                        send_tool_call(&connection, &session_id, tool_call, &session.cwd)?;
-                    }
-                    send_live_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        base_context_tokens,
-                        base_cost,
-                        &assistant,
-                        &live_usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::ToolResult(result) => {
-                    record_tool_result(&mut assistant, &result);
-                    send_tool_result(&connection, &session_id, result, &session.cwd)?;
-                    send_live_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        base_context_tokens,
-                        base_cost,
-                        &assistant,
-                        &live_usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::Metrics {
-                    token_count,
-                    duration_ms,
-                    usage,
-                    cost,
-                } => {
-                    assistant.token_count = Some(token_count);
-                    assistant.duration_ms = Some(duration_ms);
-                    if let Some(usage) = usage {
-                        assistant.apply_usage(usage, cost);
-                        live_usage.cumulative = usage;
-                    }
-                    live_usage.cost = cost.unwrap_or(live_usage.cost);
-                    send_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        live_usage
-                            .context_tokens(base_context_tokens, &assistant)
-                            .max(base_context_tokens.saturating_add(token_count)),
-                        cumulative_cost(base_cost, live_usage.cost),
-                        usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::Usage(usage) => {
-                    live_usage.observe_provider_usage(&assistant, usage);
-                    live_usage.cost += estimate_session_usage_cost(&session, &usage);
-                    assistant
-                        .parts
-                        .push(crate::session::types::MessagePart::usage(
-                            usage.input,
-                            usage.output,
-                            usage.cache_read,
-                            usage.cache_write,
-                            estimate_session_usage_cost(&session, &usage),
-                        ));
-                    if let Some(part) = assistant.parts.last_mut() {
-                        part.data["acp_prompt_tokens"] = serde_json::json!(prompt_tokens);
-                    }
-                    if usage.output > 0 {
-                        assistant.output_tokens = Some(
-                            assistant
-                                .output_tokens
-                                .unwrap_or(0)
-                                .saturating_add(usage.output as usize),
-                        );
-                    }
-                    send_live_usage(
-                        &connection,
-                        &session_id,
-                        &session,
-                        base_context_tokens,
-                        base_cost,
-                        &assistant,
-                        &live_usage,
-                    )?;
-                }
-                crate::llm::ChunkMessage::Cancelled => cancelled = true,
-                crate::llm::ChunkMessage::Failed(error) => failed = Some(error),
-                crate::llm::ChunkMessage::TurnStopReason(reason) => turn_stop_reason = Some(reason),
-                crate::llm::ChunkMessage::PermissionRequest(prompt) => {
-                    let response = request_permission(&connection, &session_id, &prompt).await;
-                    let _ = prompt.response_tx.send(response);
-                }
-                crate::llm::ChunkMessage::QuestionRequest {
-                    tool_call_id,
-                    questions,
-                    response_tx,
-                } => {
-                    let response = if self.supports_form_elicitation() {
-                        request_questions(
-                            &connection,
-                            &session_id,
-                            tool_call_id.as_deref(),
-                            &questions,
-                            &cancellation,
-                        )
-                        .await
-                    } else {
-                        skipped_question_answers(&questions)
-                    };
-                    let _ = response_tx.send(response);
-                }
-                crate::llm::ChunkMessage::TerminalSessionRequest(request) => {
-                    if self.supports_terminals() {
-                        bridge_terminal_session(
-                            &connection,
-                            &session_id,
-                            &session.cwd,
-                            request,
-                            &cancellation,
-                        )
-                        .await;
-                    } else {
-                        let _ = request
-                            .control_tx
-                            .send(crate::tools::TerminalSessionControl::Stop);
-                    }
-                }
-                crate::llm::ChunkMessage::End => break,
-                _ => {}
-            }
-        }
-
-        assistant.is_complete = true;
-        assistant.was_interrupted = cancelled || cancellation.is_cancelled();
-        {
-            let mut manager = self.session_manager.lock().map_err(|_| internal_error())?;
-            manager
-                .add_message_to_session(&session_id, &assistant)
-                .map_err(|_| internal_error())?;
-            let status = if assistant.was_interrupted {
-                crate::session::types::SessionStatus::Interrupted
-            } else if failed.is_some() {
-                crate::session::types::SessionStatus::Failed
-            } else {
-                crate::session::types::SessionStatus::Idle
-            };
-            manager
-                .set_session_status(&session_id, status, failed.as_deref())
-                .map_err(|_| internal_error())?;
-        }
-        if assistant.was_interrupted {
-            if let Some(current) = self.sessions.lock().await.get_mut(&session_id) {
-                current.cancellation = None;
-            }
-            return Ok(PromptResponse::new(StopReason::Cancelled));
-        }
-        if let Some(error) = failed {
-            if let Some(current) = self.sessions.lock().await.get_mut(&session_id) {
-                current.cancellation = None;
-            }
-            return Err(internal_error_with(&error));
-        }
-        let _ = self
-            .maybe_auto_compact_session(
+        let response = self
+            .receive_prompt_stream(
                 &session_id,
                 &session,
                 &connection,
-                cancellation.clone(),
+                &cancellation,
+                receiver,
+                base_context_tokens,
+                base_cost,
                 prompt_tokens,
-                0,
             )
             .await?;
-        if let Some(current) = self.sessions.lock().await.get_mut(&session_id) {
-            current.cancellation = None;
+        if !cancellation.is_cancelled() && response.stop_reason != StopReason::Cancelled {
+            let _ = self
+                .maybe_auto_compact_session(
+                    &session_id,
+                    &session,
+                    &connection,
+                    cancellation.clone(),
+                    prompt_tokens,
+                    0,
+                )
+                .await?;
         }
-        Ok(PromptResponse::new(acp_stop_reason(turn_stop_reason)))
+        Ok(response)
     }
 }

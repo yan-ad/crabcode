@@ -43,6 +43,7 @@ impl AcpService {
     ) -> Result<SetSessionConfigOptionResponse, Error> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
+            .attachments
             .get_mut(session_id)
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
         if session
@@ -67,6 +68,7 @@ impl AcpService {
     ) -> Result<SetSessionConfigOptionResponse, Error> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
+            .attachments
             .get_mut(session_id)
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
         let model = find_selectable_model(&session.models, model_ref)?;
@@ -91,6 +93,7 @@ impl AcpService {
     ) -> Result<SetSessionConfigOptionResponse, Error> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
+            .attachments
             .get_mut(session_id)
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
         let requested = value

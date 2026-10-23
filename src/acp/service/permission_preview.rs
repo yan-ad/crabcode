@@ -35,22 +35,30 @@ pub(super) fn permission_tool_content(
         "edit" => permission_edit_diff(&prompt.raw_input, cwd)
             .into_iter()
             .collect(),
-        "apply_patch" => crate::tools::patch::preview_patch(&prompt.raw_input, cwd)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|change| {
-                agent_client_protocol::schema::v1::Diff::new(change.path, change.new_text)
-                    .old_text(change.old_text)
-                    .into()
-            })
-            .collect(),
+        "apply_patch"
+            if crate::tools::patch::patch_paths_from_params(&prompt.raw_input)
+                .iter()
+                .all(|path| preview_read_allowed(&absolute_tool_path(path, cwd), cwd)) =>
+        {
+            crate::tools::patch::preview_patch(&prompt.raw_input, cwd)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|change| {
+                    agent_client_protocol::schema::v1::Diff::new(change.path, change.new_text)
+                        .old_text(change.old_text)
+                        .into()
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
 
 fn preflight_diff(path: &str, new_text: &str, cwd: &Path) -> ToolCallContent {
     let path = absolute_tool_path(path, cwd);
-    let old_text = std::fs::read_to_string(&path).ok();
+    let old_text = preview_read_allowed(&path, cwd)
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten();
     agent_client_protocol::schema::v1::Diff::new(path, new_text.to_string())
         .old_text(old_text)
         .into()
@@ -64,6 +72,9 @@ fn permission_edit_diff(input: &serde_json::Value, cwd: &Path) -> Option<ToolCal
     let old_string = input.get("old_string")?.as_str()?;
     let new_string = input.get("new_string")?.as_str()?;
     let absolute = absolute_tool_path(path, cwd);
+    if !preview_read_allowed(&absolute, cwd) {
+        return None;
+    }
     let old_text = std::fs::read_to_string(&absolute).ok()?;
     let new_text = if input
         .get("replace_all")
@@ -153,5 +164,64 @@ mod tests {
         assert_eq!(diff.path, path);
         assert_eq!(diff.old_text.as_deref(), Some("before\n"));
         assert_eq!(diff.new_text, "after\n");
+    }
+}
+
+fn preview_read_allowed(path: &Path, cwd: &Path) -> bool {
+    !crate::tools::permission::is_outside_workdir(path, cwd)
+        && !crate::tools::permission::is_sensitive_path(path)
+        && !std::fs::canonicalize(path)
+            .ok()
+            .is_some_and(|resolved| crate::tools::permission::is_sensitive_path(&resolved))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn previews_keep_workspace_diffs_but_do_not_read_protected_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let ordinary = workspace.path().join("hello.txt");
+        std::fs::write(&ordinary, "before").unwrap();
+        let preview =
+            serde_json::to_string(&preflight_diff("hello.txt", "after", workspace.path())).unwrap();
+        assert!(preview.contains("before"));
+        for path in [
+            workspace.path().join(".env"),
+            external.path().join("secret.txt"),
+        ] {
+            std::fs::write(&path, "secret-never-preview").unwrap();
+            let preview = serde_json::to_string(&preflight_diff(
+                path.to_str().unwrap(),
+                "after",
+                workspace.path(),
+            ))
+            .unwrap();
+            assert!(!preview.contains("secret-never-preview"));
+            assert!(permission_edit_diff(
+                &serde_json::json!({
+                    "file_path": path, "old_string": "secret", "new_string": "public"
+                }),
+                workspace.path()
+            )
+            .is_none());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn previews_reject_symlink_escape_and_sensitive_alias() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let secret = external.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let link = workspace.path().join("alias.txt");
+        std::os::unix::fs::symlink(secret, &link).unwrap();
+        assert!(!preview_read_allowed(&link, workspace.path()));
+        let env = workspace.path().join(".env");
+        std::fs::write(&env, "secret").unwrap();
+        let alias = workspace.path().join("config.txt");
+        std::os::unix::fs::symlink(env, &alias).unwrap();
+        assert!(!preview_read_allowed(&alias, workspace.path()));
     }
 }

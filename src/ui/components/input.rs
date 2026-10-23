@@ -79,7 +79,7 @@ pub struct Input {
     draft_state: Option<DraftState>,
     local_images: Vec<LocalImageAttachment>,
     pending_pastes: Vec<PendingPaste>,
-    image_open_config: crate::config::ImagesConfig,
+    pending_file_action: Option<PathBuf>,
     hovered_image_placeholder: Option<String>,
     hovered_paste_placeholder: Option<String>,
 }
@@ -134,7 +134,7 @@ impl Input {
             draft_state: None,
             local_images: Vec::new(),
             pending_pastes: Vec::new(),
-            image_open_config: crate::config::ImagesConfig::default(),
+            pending_file_action: None,
             hovered_image_placeholder: None,
             hovered_paste_placeholder: None,
         }
@@ -349,8 +349,8 @@ impl Input {
         self
     }
 
-    pub fn set_image_open_config(&mut self, config: crate::config::ImagesConfig) {
-        self.image_open_config = config;
+    pub fn take_file_action(&mut self) -> Option<PathBuf> {
+        self.pending_file_action.take()
     }
 
     pub fn contains_mouse(&self, mouse: MouseEvent) -> bool {
@@ -986,18 +986,7 @@ impl Input {
                 {
                     let offset = self.flat_offset_for_position(target_row, target_col);
                     if let Some(image) = self.image_at_offset(offset) {
-                        match image_attachment::open_path(&image.path, &self.image_open_config) {
-                            Ok(()) => push_toast(Toast::new(
-                                format!("Opened {}", image.placeholder),
-                                ToastLevel::Info,
-                                None,
-                            )),
-                            Err(err) => push_toast(Toast::new(
-                                format!("Failed to open image: {}", err),
-                                ToastLevel::Error,
-                                None,
-                            )),
-                        }
+                        self.pending_file_action = Some(image.path.clone());
                         return true;
                     }
                     if let Some((range, paste)) = self.paste_at_offset(offset) {
@@ -1245,7 +1234,7 @@ impl Input {
 
     fn command_query(&self) -> Option<String> {
         let text = self.get_text();
-        if !text.starts_with('/') || text.contains('\n') {
+        if !text.starts_with('/') || text.chars().any(char::is_whitespace) {
             return None;
         }
         Some(text.trim_start_matches('/').to_string())
@@ -1845,17 +1834,27 @@ impl Input {
         }
     }
 
-    fn configured_agent_names(&self) -> Vec<String> {
-        self.autocomplete
-            .as_ref()
-            .map(|autocomplete| {
-                autocomplete
-                    .agents
-                    .iter()
-                    .map(|agent| agent.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Agent names, then skill names that don't collide with an agent.
+    /// Collisions keep the agent so `@explore` stays an agent mention.
+    fn configured_mention_names(&self) -> Vec<String> {
+        let Some(autocomplete) = &self.autocomplete else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = autocomplete
+            .agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        for skill in &autocomplete.skills {
+            if names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&skill.name))
+            {
+                continue;
+            }
+            names.push(skill.name.clone());
+        }
+        names
     }
 
     fn style_agent_mention_ranges(
@@ -1869,7 +1868,7 @@ impl Input {
             return;
         }
 
-        let agent_names = self.configured_agent_names();
+        let agent_names = self.configured_mention_names();
         if agent_names.is_empty() {
             return;
         }
@@ -2239,7 +2238,7 @@ impl Input {
                 let text = self.get_text();
                 self.replace_range(0..text.len(), &replacement);
             }
-            SuggestionKind::Agent => {
+            SuggestionKind::Agent | SuggestionKind::Skill => {
                 let Some(token) = self.current_at_token(true) else {
                     return;
                 };
@@ -2285,33 +2284,9 @@ impl Input {
     }
 
     pub fn get_autocomplete_selection(&self, is_chat: bool) -> Option<String> {
-        if let Some(autocomplete) = &self.autocomplete {
-            let suggestions = if let Some(filter) = self.command_query() {
-                autocomplete.command_auto.get_suggestions(&filter, is_chat)
-            } else if let Some(token) = self.current_at_token(true) {
-                let mut suggestions = Vec::new();
-                suggestions.extend(
-                    autocomplete
-                        .agents
-                        .iter()
-                        .filter(|agent| {
-                            agent
-                                .name
-                                .to_ascii_lowercase()
-                                .starts_with(&token.query.to_ascii_lowercase())
-                        })
-                        .cloned(),
-                );
-                suggestions.extend(autocomplete.file_auto.get_suggestions(&token.query));
-                suggestions
-            } else {
-                Vec::new()
-            };
-            if !suggestions.is_empty() {
-                return Some(suggestions[0].name.clone());
-            }
-        }
-        None
+        self.get_autocomplete_suggestions(is_chat)
+            .first()
+            .map(|suggestion| suggestion.name.clone())
     }
 
     pub fn get_text(&self) -> String {
@@ -2452,21 +2427,7 @@ impl Input {
                 return autocomplete.command_auto.get_suggestions(&filter, is_chat);
             }
             if let Some(token) = self.current_at_token(true) {
-                let mut suggestions = Vec::new();
-                suggestions.extend(
-                    autocomplete
-                        .agents
-                        .iter()
-                        .filter(|agent| {
-                            agent
-                                .name
-                                .to_ascii_lowercase()
-                                .starts_with(&token.query.to_ascii_lowercase())
-                        })
-                        .cloned(),
-                );
-                suggestions.extend(autocomplete.file_auto.get_suggestions(&token.query));
-                return suggestions;
+                return autocomplete.mention_suggestions(&token.query);
             }
         }
         Vec::new()
@@ -3177,6 +3138,76 @@ mod tests {
     }
 
     #[test]
+    fn test_skill_autocomplete_is_discovered_with_mentions_not_slashes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut input = Input::new().with_autocomplete(
+            AutoComplete::new_at_with_file_config(
+                crate::autocomplete::CommandAuto::default(),
+                root.path(),
+                false,
+                Vec::new(),
+            )
+            .with_agents(vec![Suggestion::agent("explore", "Explore code")])
+            .with_skills(vec![
+                Suggestion::skill("ratatui", "Build terminal UIs"),
+                Suggestion::skill("codebase-design", "Design deep modules"),
+            ]),
+        );
+        for is_chat in [false, true] {
+            input.set_text("@");
+            let suggestions = input.get_autocomplete_suggestions(is_chat);
+            assert_eq!(suggestions[0].name, "codebase-design");
+            assert_eq!(suggestions[0].kind, SuggestionKind::Skill);
+            assert_eq!(suggestions[1].name, "ratatui");
+            assert_eq!(suggestions[2].kind, SuggestionKind::Agent);
+
+            input.set_text("@CODE");
+            assert_eq!(
+                input.get_autocomplete_suggestions(is_chat),
+                vec![Suggestion::skill("codebase-design", "Design deep modules")]
+            );
+            assert_eq!(
+                input.get_autocomplete_selection(is_chat).as_deref(),
+                Some("codebase-design")
+            );
+
+            input.set_text("/code");
+            assert!(input.get_autocomplete_suggestions(is_chat).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_skill_completion_replaces_only_current_mention() {
+        let mut input = Input::new();
+        input.set_text("Use @code and keep the rest");
+        input.textarea.move_cursor(CursorMove::Jump(0, 9));
+        input.apply_suggestion(&Suggestion::skill("codebase-design", "Design deep modules"));
+        assert_eq!(input.get_text(), "Use @codebase-design  and keep the rest");
+        assert_eq!(input.submission_text(), input.get_text());
+        assert!(!input.should_show_suggestions());
+    }
+
+    #[test]
+    fn test_skill_completion_inside_slash_command_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let mut input = Input::new().with_autocomplete(
+            AutoComplete::new_at_with_file_config(
+                crate::autocomplete::CommandAuto::default(),
+                root.path(),
+                false,
+                Vec::new(),
+            )
+            .with_skills(vec![Suggestion::skill(
+                "codebase-design",
+                "Design deep modules",
+            )]),
+        );
+        input.set_text("/review @code");
+        input.complete_selection(true);
+        assert_eq!(input.get_text(), "/review @codebase-design ");
+    }
+
+    #[test]
     fn test_wrapped_input_and_paste_increase_height_like_newlines() {
         let mut newline_input = Input::new();
         newline_input.insert_str("a");
@@ -3314,6 +3345,44 @@ mod tests {
         assert!(input.has_active_selection_edge_scroll());
         assert_eq!(input.textarea.cursor(), (0, 14));
         assert_eq!(input.get_selected_text(), "0123456789ABCD");
+    }
+
+    #[test]
+    fn image_click_requests_file_actions_without_opening() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("screenshot.png");
+        std::fs::write(&path, [0, 255]).unwrap();
+        let mut input = Input::new();
+        input.attach_image(path.clone());
+
+        let colors = test_colors();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                input.render(
+                    frame,
+                    Rect::new(0, 0, 60, 8),
+                    "Plan",
+                    "model",
+                    "provider",
+                    None,
+                    false,
+                    &colors,
+                    true,
+                );
+            })
+            .unwrap();
+        let (x, y) = find_buffer_text(terminal.backend().buffer(), 60, 8, "[Image #1]")
+            .expect("image placeholder rendered");
+        assert!(input.handle_mouse_event(mouse_event_at(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+        )));
+        assert_eq!(input.take_file_action(), Some(path));
+        assert_eq!(input.take_file_action(), None);
     }
 
     #[test]
@@ -3615,6 +3684,55 @@ mod tests {
         assert_eq!(
             buffer.cell(general_pos).expect("general cell").style().fg,
             Some(colors.success)
+        );
+    }
+
+    #[test]
+    fn test_skill_mentions_render_with_the_same_mention_colors_as_agents() {
+        use crate::autocomplete::{AutoComplete, CommandAuto, Suggestion};
+        use crate::command::registry::Registry;
+        use crate::theme::agent_color;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut input = Input::new();
+        input.autocomplete = Some(
+            AutoComplete::new(CommandAuto::new(&Registry::new()))
+                .with_agents(vec![Suggestion::agent("explore", "Explore agent")])
+                .with_skills(vec![
+                    Suggestion::skill("explore", "Name collision stays an agent"),
+                    Suggestion::skill("codebase-design", "Design deep modules"),
+                ]),
+        );
+        input.insert_str("@explore and @codebase-design");
+
+        let colors = test_colors();
+        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                input.render(
+                    frame,
+                    Rect::new(0, 0, 48, 6),
+                    "Plan",
+                    "model",
+                    "provider",
+                    None,
+                    false,
+                    &colors,
+                    true,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let explore_pos = find_buffer_text(buffer, 48, 6, "@explore").expect("explore mention");
+        let skill_pos = find_buffer_text(buffer, 48, 6, "@codebase-design").expect("skill mention");
+        assert_eq!(
+            buffer.cell(explore_pos).expect("explore cell").style().fg,
+            Some(colors.warning)
+        );
+        assert_eq!(
+            buffer.cell(skill_pos).expect("skill cell").style().fg,
+            Some(agent_color("codebase-design", &colors))
         );
     }
 

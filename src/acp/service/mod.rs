@@ -29,7 +29,7 @@ mod test_support;
 use crate::config::configuration::LoadedConfig;
 use crate::session::manager::SessionManager;
 use agent_client_protocol::Error;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AcpService {
-    sessions: Arc<AsyncMutex<HashMap<String, AcpSession>>>,
+    sessions: Arc<AsyncMutex<AcpSessions>>,
     session_manager: Arc<Mutex<SessionManager>>,
     client_capabilities: Arc<Mutex<agent_client_protocol::schema::v1::ClientCapabilities>>,
 }
@@ -74,7 +74,7 @@ impl AcpService {
             .with_history_for_workspace(initial_workspace)
             .map_err(|_| internal_error())?;
         Ok(Self {
-            sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+            sessions: Arc::new(AsyncMutex::new(AcpSessions::default())),
             session_manager: Arc::new(Mutex::new(session_manager)),
             client_capabilities: Arc::new(Mutex::new(Default::default())),
         })
@@ -103,5 +103,95 @@ impl AcpService {
             .lock()
             .ok()
             .is_some_and(|capabilities| capabilities.terminal)
+    }
+}
+
+// Attachments detach immediately on close, but a turn retains ownership until all
+// transcript/status finalization finishes. Both are protected by the same lock.
+#[derive(Default)]
+struct AcpSessions {
+    attachments: HashMap<String, AcpSession>,
+    active_prompts: HashSet<String>,
+}
+
+impl AcpSessions {
+    fn ensure_attachable(&self, session_id: &str) -> Result<(), Error> {
+        if self.active_prompts.contains(session_id) {
+            return Err(Error::invalid_params().data("session already has an active prompt"));
+        }
+        Ok(())
+    }
+
+    fn begin_prompt(&mut self, session_id: &str) -> Result<CancellationToken, Error> {
+        self.ensure_attachable(session_id)?;
+        let session = self
+            .attachments
+            .get_mut(session_id)
+            .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
+        let cancellation = CancellationToken::new();
+        session.cancellation = Some(cancellation.clone());
+        self.active_prompts.insert(session_id.to_string());
+        Ok(cancellation)
+    }
+
+    // Call only after the stream and wrapper have finished every persisted write.
+    fn finish_prompt(&mut self, session_id: &str) {
+        if let Some(session) = self.attachments.get_mut(session_id) {
+            session.cancellation = None;
+        }
+        self.active_prompts.remove(session_id);
+    }
+}
+
+async fn cancellable<T>(
+    token: &CancellationToken,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => None,
+        result = future => Some(result),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancellation_drops_pending_generation_without_waiting() {
+        struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let token = CancellationToken::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = OnDrop(dropped.clone());
+        let future = async move {
+            let _guard = guard;
+            std::future::pending::<String>().await
+        };
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        });
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cancellable(&token, future)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn cancellation_wins_over_already_ready_answer() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(cancellable(&token, std::future::ready("answer"))
+            .await
+            .is_none());
     }
 }

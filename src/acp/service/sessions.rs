@@ -110,7 +110,7 @@ impl AcpService {
 
         let skills = crate::skill::SkillStore::load(&config.xdg_config_home, &config.project_root);
         let tool_permissions = configured_tool_permissions(&cwd, &config);
-        self.sessions.lock().await.insert(
+        self.sessions.lock().await.attachments.insert(
             session_id.clone(),
             AcpSession {
                 cwd,
@@ -132,6 +132,7 @@ impl AcpService {
             .sessions
             .lock()
             .await
+            .attachments
             .get(&session_id)
             .cloned()
             .ok_or_else(internal_error)?;
@@ -230,7 +231,7 @@ impl AcpService {
             }
             fork_id
         };
-        self.sessions.lock().await.insert(
+        self.sessions.lock().await.attachments.insert(
             fork_id.clone(),
             AcpSession {
                 tool_permissions: configured_tool_permissions(&source.cwd, &source.config),
@@ -243,7 +244,7 @@ impl AcpService {
     }
 
     pub async fn close_session(&self, session_id: &str) {
-        if let Some(session) = self.sessions.lock().await.remove(session_id) {
+        if let Some(session) = self.sessions.lock().await.attachments.remove(session_id) {
             if let Some(cancellation) = session.cancellation {
                 cancellation.cancel();
             }
@@ -261,7 +262,7 @@ impl AcpService {
     }
 
     pub async fn cancel_session(&self, session_id: &str) {
-        if let Some(session) = self.sessions.lock().await.get(session_id) {
+        if let Some(session) = self.sessions.lock().await.attachments.get(session_id) {
             if let Some(cancellation) = &session.cancellation {
                 cancellation.cancel();
             }
@@ -273,13 +274,28 @@ impl AcpService {
         session_id: &str,
         cwd: PathBuf,
     ) -> Result<(AcpSession, Vec<crate::session::types::Message>), Error> {
+        // Fail promptly during close cleanup, before model/config discovery. Recheck
+        // below after awaits and hold the lock through the actual attachment.
+        self.sessions.lock().await.ensure_attachable(session_id)?;
         let cwd = workspace_path(&cwd)?;
+        // Invalid load/resume requests must not wait on network model discovery.
+        {
+            let manager = self.session_manager.lock().map_err(|_| internal_error())?;
+            let stored = manager
+                .get_session_ref(session_id)
+                .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
+            if stored.workspace_path != cwd.to_string_lossy() {
+                return Err(Error::invalid_params().data("session does not belong to cwd"));
+            }
+        }
         let config = crate::config::ConfigLoader::load_for(&cwd).map_err(|_| internal_error())?;
         crate::skill::init_skill_store(&config.xdg_config_home, &config.project_root);
         let models = crate::model::catalog::selectable_models(&config, None)
             .await
             .map_err(|_| internal_error())?;
 
+        let mut sessions = self.sessions.lock().await;
+        sessions.ensure_attachable(session_id)?;
         let messages = {
             let mut manager = self.session_manager.lock().map_err(|_| internal_error())?;
             let stored = manager
@@ -336,9 +352,8 @@ impl AcpService {
             context_window,
             cancellation: None,
         };
-        self.sessions
-            .lock()
-            .await
+        sessions
+            .attachments
             .insert(session_id.to_string(), session.clone());
         Ok((session, messages))
     }

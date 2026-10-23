@@ -8,7 +8,6 @@ use crate::session::manager::SessionManager;
 use agent_client_protocol::schema::v1::SessionNotification;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
@@ -197,7 +196,7 @@ async fn acp_compaction_notifies_client_of_reduced_context_and_summary_cost() {
                 .replace_session_messages(&session_id, compacted)
                 .unwrap();
             let service = AcpService {
-                sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+                sessions: Arc::new(AsyncMutex::new(super::super::AcpSessions::default())),
                 session_manager: Arc::new(Mutex::new(manager)),
                 client_capabilities: Arc::new(Mutex::new(Default::default())),
             };

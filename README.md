@@ -19,7 +19,7 @@ A purely Rust-based AI CLI coding agent with a beautiful terminal UI for interac
 - **Terminal UI (TUI)** - Beautiful, responsive interface built with [ratatui](https://github.com/ratatui-org/ratatui)
 - **Built for the OpenCode user** - works out of the box w/ opencode themes, every UX, and some existing configs so you don't need to force your team to use crabcode.
   - **Same UX** - carefully ported most of the good UX from OpenCode i.e. shortcuts, etc.
-  - **Agent System** - Switch between PLAN (read-only analysis) and BUILD (implementation) agents with TAB, and custom agents.
+  - **Agent System** - Switch between PLAN (read-only analysis) and BUILD (implementation) agents with Shift+Tab, and custom agents.
   - **Multiple Model Support** - Works w/ the same models.dev support.
   - **Command System** - Intuitive commands: `/sessions`, `/new`, `/connect`, `/models`, `/exit` + custom commands.
   - **Session Management** - Create and manage multiple chat sessions
@@ -77,7 +77,7 @@ It works (almost) exactly like OpenCode. Just opens faster, with some intuitive 
 - **ACP editor integration** - Run `crabcode acp` from compatible editors. See the [ACP capability matrix](_docs/acp.mdx).
 - My own UX preferences:
   - Can click on `[Image #1]` tags to open them.
-  - Themes has no background, all tranluscent (don't really care right now).
+  - Which-key-like shortcuts using ctrl-x (+ a lot more shortcuts than OpenCode).
   - Lots of toolcall-shapes inspired by the actual Codex harness.
   - When switching models, you can press `⇆` to change thinking efforts.
   - Copy on select is disabled by default. Copy is two-step in crabcode. Gets annoying in OpenCode, especially w/ clipboard history.
@@ -127,7 +127,7 @@ Read the [configuration docs here](/_docs/config/index.mdx).
 
 I tried crabcode specifically for these providers:
 
-- [x] **openai** (both API key and OAuth, thank you OpenAI for supporting harnesses!)
+- [x] **openai** (both API key and OAuth, thank you OpenAI for supporting OSS harnesses!)
 - [x] **xAI / Grok** (API key and SuperGrok/X Premium OAuth, thank you xAI for openly supporting OSS harnesses: based on [OpenClaw](https://x.ai/news/grok-openclaw), [OpenCode](https://x.ai/news/grok-opencode), [KiloCode](https://x.ai/news/grok-kilocode), [Hermes](https://x.ai/news/grok-hermes))
 - [x] **opencode-zen** and **opencode-go**
 - [x] **nano-gpt**

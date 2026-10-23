@@ -13,6 +13,10 @@ test-upgrade-ui:
     cargo build --bin crabcode
     bun test --timeout 30000 scripts/upgrade-ui.test.ts
 
+[doc('Check registry publishing workflow and npm archive compatibility')]
+test-release:
+    bun test scripts/release-workflow.test.ts npm/install.test.js
+
 dev:
     cargo r
 

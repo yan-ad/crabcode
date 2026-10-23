@@ -1,3 +1,4 @@
+use super::cancellable;
 use super::internal_error;
 use super::internal_error_with;
 use super::notifications::send_text;
@@ -13,6 +14,7 @@ use agent_client_protocol::schema::v1::UnstructuredCommandInput;
 use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Error;
+use tokio_util::sync::CancellationToken;
 
 pub(super) fn command_text(parts: &[ContentBlock]) -> String {
     parts
@@ -111,6 +113,7 @@ impl AcpService {
     ) -> Result<AvailableCommandsUpdate, Error> {
         let sessions = self.sessions.lock().await;
         let session = sessions
+            .attachments
             .get(session_id)
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
         Ok(AvailableCommandsUpdate::new(available_commands(session)))
@@ -122,6 +125,7 @@ impl AcpService {
         session: AcpSession,
         question: String,
         connection: ConnectionTo<Client>,
+        cancellation: CancellationToken,
     ) -> Result<PromptResponse, Error> {
         let history = self
             .session_manager
@@ -130,14 +134,27 @@ impl AcpService {
             .get_session_ref(session_id)
             .map(|stored| stored.messages.clone())
             .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
-        let answer = crate::llm::client::generate_btw_answer(
-            session.provider,
-            session.model,
-            question,
-            history,
-        )
-        .await
-        .map_err(|error| internal_error_with(&error.to_string()))?;
+        let answer = {
+            let result = cancellable(
+                &cancellation,
+                crate::llm::client::generate_btw_answer(
+                    session.provider,
+                    session.model,
+                    question,
+                    history,
+                ),
+            )
+            .await;
+            let Some(result) = result else {
+                return Ok(PromptResponse::new(StopReason::Cancelled));
+            };
+            result.map_err(|error| internal_error_with(&error.to_string()))?
+        };
+        // Serialize notification with close/delete, which cancel under this same lock.
+        let sessions = self.sessions.lock().await;
+        if cancellation.is_cancelled() || !sessions.attachments.contains_key(session_id) {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
         send_text(&connection, session_id, &cuid2::create_id(), answer, false)?;
         Ok(PromptResponse::new(StopReason::EndTurn))
     }
