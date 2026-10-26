@@ -2107,6 +2107,12 @@ impl Chat {
         self.add_message(Message::assistant(content));
     }
 
+    pub fn get_last_assistant_message_mut(&mut self) -> Option<&mut Message> {
+        self.messages
+            .iter_mut()
+            .rfind(|message| message.role == MessageRole::Assistant)
+    }
+
     fn streaming_assistant_idx(&self) -> Option<usize> {
         self.messages
             .iter()

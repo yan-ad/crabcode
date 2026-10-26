@@ -132,7 +132,7 @@ pub fn handle_connect<'a>(
                 ("anthropic", "Anthropic"),
                 ("openai", "OpenAI"),
                 ("xai", "xAI"),
-                ("google", "Google"),
+                ("google", "Google Antigravity"),
             ] {
                 out.insert(
                     id.to_string(),

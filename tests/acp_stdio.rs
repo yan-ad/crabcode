@@ -576,6 +576,10 @@ Wire skill instructions.
         }
     }));
     let (new_session, mut notifications) = process.recv_response(2);
+    assert!(
+        new_session.get("error").is_none(),
+        "session setup: {new_session}"
+    );
     let expected_description =
         "Compaction agent. Summarizes conversation context for continued work.";
     let compaction_mode = new_session["result"]["modes"]["availableModes"]
