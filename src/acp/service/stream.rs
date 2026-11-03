@@ -6,7 +6,7 @@ use super::transcript::{record_tool_call, record_tool_result};
 use super::usage::{
     cumulative_cost, estimate_session_usage_cost, send_live_usage, send_usage, AcpLiveUsage,
 };
-use super::{cancellable, internal_error, internal_error_with, AcpService, AcpSession};
+use super::{cancellable, internal_error, AcpService, AcpSession};
 use agent_client_protocol::schema::v1::{PromptResponse, StopReason};
 use agent_client_protocol::{Client, ConnectionTo, Error};
 use tokio_util::sync::CancellationToken;
@@ -170,7 +170,10 @@ impl AcpService {
                         cancelled = true;
                         break;
                     }
-                    crate::llm::ChunkMessage::Failed(error) => failed = Some(error),
+                    crate::llm::ChunkMessage::Failed(error) => {
+                        failed = Some(error);
+                        break;
+                    }
                     crate::llm::ChunkMessage::TurnStopReason(reason) => {
                         turn_stop_reason = Some(reason)
                     }
@@ -223,6 +226,42 @@ impl AcpService {
                 }
             }
 
+            if !cancelled && !cancellation.is_cancelled() {
+                if let Some(error) = failed.as_deref() {
+                    let pending_ids = assistant
+                        .parts
+                        .iter()
+                        .filter(|part| part.part_type == "tool_call")
+                        .filter_map(|part| part.tool_id().map(str::to_string))
+                        .filter(|id| {
+                            assistant.tool_result_part_data(id).is_none_or(|data| {
+                                matches!(data.get("status").and_then(|s| s.as_str()),
+                                    None | Some("running" | "pending"))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    assistant.mark_running_tool_parts_failed(error);
+                    for id in pending_ids {
+                        let payload = assistant.tool_result_part_data(&id).unwrap();
+                        send_tool_result(
+                            connection,
+                            session_id,
+                            crate::llm::ToolCallResult {
+                                tool_call_id: id,
+                                role: "tool".to_string(),
+                                name: payload["name"].as_str().unwrap_or("tool").to_string(),
+                                content: payload.to_string(),
+                            },
+                            &session.cwd,
+                        )?;
+                    }
+                    let text = format!(
+                        "\n\nThe AI request failed: {error}\nYou can retry or send another message in this session."
+                    );
+                    assistant.append(&text);
+                    send_text(connection, session_id, &message_id, text, false)?;
+                }
+            }
             Ok(())
         }
         .await;
@@ -231,12 +270,19 @@ impl AcpService {
         }
         assistant.is_complete = true;
         assistant.was_interrupted = cancelled || cancellation.is_cancelled();
+        if assistant.was_interrupted || failed.is_some() {
+            assistant.mark_running_tool_parts_failed(
+                failed
+                    .as_deref()
+                    .unwrap_or("Tool execution cancelled by user"),
+            );
+        }
         {
             let mut manager = self.session_manager.lock().map_err(|_| internal_error())?;
             let persist_result = manager.add_message_to_session(session_id, &assistant);
             let status = if assistant.was_interrupted {
                 crate::session::types::SessionStatus::Interrupted
-            } else if failed.is_some() {
+            } else if stream_result.is_err() {
                 crate::session::types::SessionStatus::Failed
             } else {
                 crate::session::types::SessionStatus::Idle
@@ -250,8 +296,8 @@ impl AcpService {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
         stream_result?;
-        if let Some(error) = failed {
-            return Err(internal_error_with(&error));
+        if failed.is_some() {
+            return Ok(PromptResponse::new(StopReason::EndTurn));
         }
         Ok(PromptResponse::new(acp_stop_reason(turn_stop_reason)))
     }
